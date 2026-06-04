@@ -1,0 +1,30 @@
+[project]
+name = "video-agent"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx-whisper>=0.4.3",
+    "pillow>=12.2.0",
+    "python-dotenv>=1.2.2",
+    "requests>=2.34.2",
+    "xai-sdk>=1.15.0",
+    "yt-dlp>=2026.3.17",
+]
+
+[project.scripts]
+video-agent = "video_agent:main"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["video_agent"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
