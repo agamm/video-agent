@@ -1,32 +1,21 @@
 # video-agent
 
-Give Claude Code the ability to edit videos.
+Give Claude Code the ability to **find, edit, and overlay** anything in a video — using AI and ffmpeg together.
 
-Five commands that handle what ffmpeg can't do alone — download, transcribe, find specific moments, and AI-edit footage. Claude drives all of it through natural language.
+A single Python file + CLI. Claude drives it through natural language; you get frame-accurate edits without writing ffmpeg commands.
 
 ---
 
-## What you can do
+## What it does
 
-**Find any moment in a video**
-```
-detect a character's face and change their eye color with Grok
-find every time the speaker says "um" and remove it
-locate the product close-up and overlay a logo
-```
-
-**Edit with AI**
-```
-make the sunglasses solid red in every shot
-change the background to a beach
-```
-
-**Transcribe and cut**
-```
-transcribe the interview, find all the filler words, clean them up iteratively
-```
-
-**Download + edit any YouTube video**
+| Task | How |
+|------|-----|
+| Find a specific moment (butterfly, face, object) | `detect` builds labeled frame grids Claude reads visually |
+| AI-edit a region (change color, add effect) | `grok-edit` chunks the clip, sends to xAI Grok, splices back |
+| Burn in text or images | `overlay-text` / `overlay-image` — pure ffmpeg, no AI |
+| Trim, concat, extract frames | codec-universal (handles AV1 via PyAV) |
+| Download any YouTube video | `yt-dl` via yt-dlp |
+| Transcribe + clean filler words | `transcribe` via mlx-whisper (Apple Silicon) |
 
 ---
 
@@ -35,16 +24,13 @@ transcribe the interview, find all the filler words, clean them up iteratively
 Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and ffmpeg.
 
 ```bash
-# ffmpeg (if not already installed)
-mise install ffmpeg   # or: brew install ffmpeg
-
-# clone and install
+mise install ffmpeg        # or: brew install ffmpeg
 git clone https://github.com/yourname/video-agent
 cd video-agent
 uv sync
 ```
 
-Set your xAI key in `.env` (needed for `grok-edit`):
+Add your xAI key to `.env` (only needed for `grok-edit`):
 ```
 XAI_API_KEY=xai-...
 ```
@@ -53,53 +39,119 @@ XAI_API_KEY=xai-...
 
 ## Commands
 
-```bash
-uv run video-agent info <video>
-uv run video-agent yt-dl <url> [-o path]
-uv run video-agent transcribe <video> [-o out.txt] [--words]
-uv run video-agent detect <video> --start S --end E -o grids/
-uv run video-agent grok-edit <video> --prompt "..." -o out.mp4
+```
+uv run video-agent info          <video>
+uv run video-agent yt-dl         <url> [-o path]
+uv run video-agent transcribe    <video> [-o out.txt] [--words]
+uv run video-agent detect        <video> --start S --end E -o grids/
+uv run video-agent trim          <video> --start S --end E -o out.mp4
+uv run video-agent frame         <video> --at T -o frame.png
+uv run video-agent concat        a.mp4 b.mp4 ... -o out.mp4
+uv run video-agent grok-edit     <video> --prompt "..." -o out.mp4
+uv run video-agent overlay-text  <video> --text "..." --x center --y center -o out.mp4
+uv run video-agent overlay-image <video> --image logo.png --x "W-w-20" --y 20 -o out.mp4
+uv run video-agent overlay-texts <video> --items "3:5:6" "2:6:7" "1:7:8" -o out.mp4
 ```
 
-| Command | What it does |
-|---|---|
-| `info` | Print fps, resolution, duration, frame count |
-| `yt-dl` | Download any YouTube (or Vimeo, Twitter, etc.) video as MP4 |
-| `transcribe` | Speech-to-text with timestamps. `--words` gives per-word timing for precise cuts |
-| `detect` | Sample frames into labeled grid images — Claude reads them to find matching moments |
-| `grok-edit` | AI video edit via xAI Grok. Handles chunking, tunnel, and audio stitch automatically |
-
-Position values accept frame numbers (`90`) or timestamps (`3.0`, `00:01:30`).
-
----
-
-## Use with Claude Code
-
-Tell Claude what you want in plain English. Claude uses these commands as building blocks alongside ffmpeg for everything else (trim, cut, concat, overlay, normalize, color grade, speed, etc.).
-
-Example prompts:
-- *"Download this YouTube video and remove all the ums and uhs"*
-- *"Find every frame where the speaker is looking down at the camera and make their sunglasses red"*
-- *"Trim the video to the first 2 minutes, normalize the audio, and export at 1080p"*
-
-Claude reads the `CLAUDE.md` in this repo to know exactly how to use each tool.
+**Position values** accept frame numbers (`90`), seconds (`3.0`), or timestamps (`00:01:30`).  
+For `detect` step: integers = frame count, floats < 1 = seconds (`--step 0.05` = every 50ms).
 
 ---
 
 ## How detect works
 
-`detect` extracts frames, packs them into labeled grid images, and saves them alongside a `mapping.json`. Claude reads the grid images visually, notes which cells match, and maps them back to exact frame numbers — no separate API call needed.
+`detect` samples frames into labeled grid images and saves `mapping.json`. Claude reads the grids visually, notes which cells contain what you're looking for, and converts back to exact timestamps using the mapping.
 
 ```bash
-uv run video-agent detect interview.mp4 --start 0 --end 300 -o grids/
-# → grids/grid_000.png, grid_001.png, ... + mapping.json
+# Coarse scan (1fps) to find a region
+uv run video-agent detect video.mp4 --start 0.0 --end 120.0 --step 0.04 -o grids/scan/
+
+# Fine scan (every frame, large cells) to find exact boundaries
+uv run video-agent detect video.mp4 --start 75.0 --end 85.0 --step 1 --cell-w 384 -o grids/fine/
 ```
+
+Use `--cell-w 384` (2× default) to make small or distant subjects visible.
+
+---
+
+## How grok-edit works
+
+```bash
+# Edit a standalone clip
+uv run video-agent grok-edit clip.mp4 --prompt "Make the butterfly a ladybug" -o out.mp4
+
+# Edit a region of a longer video and splice it back in
+uv run video-agent grok-edit clip.mp4 --prompt "Add a cartoon explosion" \
+    --splice-into source.mp4 --splice-start 83.0 --splice-end 86.0 \
+    -o final.mp4
+```
+
+**What happens internally:**
+1. Clip is downscaled to 720p / 2Mbps (fits gRPC's 4MB limit)
+2. Split into ≤5s chunks, each sent to Grok as a base64 data URL (no tunnel needed)
+3. Edited chunks are concatenated; original audio is stitched back
+4. If `--splice-into` is set, before/after sections are trimmed and everything is reassembled
+
+**AV1 sources** (common from YouTube downloads) are decoded via PyAV/libdav1d — ffmpeg's AV1 decoder is broken on some builds.
+
+### Grok-edit tips
+
+- **Shot boundaries first** — find natural scene cuts in the detect grid and trim each shot separately; don't split chunks across cuts or the second shot gets re-imagined in a different style
+- **Boundary precision matters** — use `detect --step 1 --cell-w 384` to find the exact first/last frame of your subject; send only those frames, not surrounding context
+- **Chunk size** — 5s chunks balance style drift vs. seam count; shorter = more seams, longer = more drift per chunk
+- **Prompts** — describe what to *add/change*, not what to keep; Grok ignores negative constraints poorly
+- **Audio** — Grok outputs video only; the tool restores original audio automatically
+
+---
+
+## Overlay text and images
+
+No AI needed — pure ffmpeg.
+
+```bash
+# Countdown before an event
+uv run video-agent overlay-texts video.mp4 \
+    --items "3:5.0:6.0" "2:6.0:7.0" "1:7.0:8.0" \
+    --size 180 --color yellow -o out.mp4
+
+# Watermark (top-right corner)
+uv run video-agent overlay-image video.mp4 --image logo.png \
+    --x "W-w-20" --y 20 --scale 200:100 -o out.mp4
+
+# Subtitle-style text at a specific time
+uv run video-agent overlay-text video.mp4 --text "BOOM!" \
+    --x center --y center --size 120 --color white \
+    --start 5.0 --end 7.0 -o out.mp4
+```
+
+> **Note:** The mise-installed ffmpeg lacks `libfreetype` (`drawtext` unavailable). Text is rendered via PIL to a transparent PNG and composited with ffmpeg's `overlay` filter.
+
+---
+
+## Use with Claude Code
+
+Claude reads `CLAUDE.md` in this repo for detailed usage instructions. Tell it what you want in plain English:
+
+- *"Find every frame in the first 2 minutes where there's a butterfly and change it to a ladybug"*
+- *"Download this YouTube video, remove filler words, and normalize the audio"*
+- *"Add an explosion effect when the apple hits the ground, then add a 3-2-1 countdown before it"*
+
+Claude will use `detect` to find regions, `trim` to isolate them, `grok-edit` to transform them, and splice everything back with the original audio intact.
 
 ---
 
 ## Requirements
 
-- macOS (uses `h264_videotoolbox`; change `VCODEC` in `video_agent.py` to `libx264` on Linux)
-- ffmpeg + ffprobe on PATH
-- `cloudflared` on PATH for `grok-edit` (`mise install cloudflared`)
-- Apple Silicon for `transcribe` (mlx-whisper)
+- **Python** 3.11+
+- **ffmpeg** + ffprobe on PATH (`mise install ffmpeg` or `brew install ffmpeg`)
+- **macOS** for hardware encoding (`h264_videotoolbox`); set `VCODEC = "libx264"` in `video_agent.py` for Linux
+- **Apple Silicon** for `transcribe` (mlx-whisper; downloaded on first use, ~1.5GB)
+- **xAI API key** for `grok-edit` — get one at [console.x.ai](https://console.x.ai)
+
+No cloudflared or tunnels needed — Grok receives video as base64 inline in the request.
+
+---
+
+## License
+
+MIT

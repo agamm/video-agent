@@ -4,5 +4,19 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .DS_Store
+
+# media — never commit
 inputs/
 grids/
+*.mp4
+*.aac
+*.mov
+*.avi
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# claude code
+.claude/
