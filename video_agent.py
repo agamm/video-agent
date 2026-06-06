@@ -74,6 +74,45 @@ def video_info(path: str) -> dict:
             "codec": s.get("codec_name", "unknown")}
 
 
+def speech_segments(path: str, noise_db: float = -30.0,
+                    min_silence: float = 0.15) -> list:
+    """Detect speech vs silence spans via ffmpeg `silencedetect`.
+
+    Returns a gap-free list of (start, end, kind) over [0, duration], where kind is
+    "speech" or "silence". The value is the **inversion**: silencedetect reports only
+    silence intervals; this fills the gaps as speech, which is the form you actually want
+    for finding an isolated filler ("um" = a lone speech burst between two silences) — far
+    more reliable than whisper word timestamps, which jitter ±0.3-0.7s between runs.
+    """
+    dur = video_info(path)["duration"]
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", path, "-af",
+         f"silencedetect=noise={noise_db}dB:d={min_silence}", "-f", "null", "-"],
+        capture_output=True, text=True)
+    silences = []
+    start = None
+    for line in proc.stderr.splitlines():
+        if "silence_start:" in line:
+            start = float(line.split("silence_start:")[1].split()[0])
+        elif "silence_end:" in line:
+            end = float(line.split("silence_end:")[1].split()[0])
+            silences.append((max(0.0, start if start is not None else 0.0),
+                             min(dur, end)))
+            start = None
+    if start is not None:                      # file ends mid-silence
+        silences.append((max(0.0, start), dur))
+    spans = []
+    cursor = 0.0
+    for s0, s1 in silences:
+        if s0 > cursor + 1e-3:
+            spans.append((cursor, s0, "speech"))
+        spans.append((s0, s1, "silence"))
+        cursor = s1
+    if cursor < dur - 1e-3:
+        spans.append((cursor, dur, "speech"))
+    return spans
+
+
 def to_seconds(value, fps: float) -> float:
     """Frame number or timestamp → seconds. Bare integer = frame number."""
     if isinstance(value, int):
@@ -223,7 +262,7 @@ def _pyav_trim(src: str, out: str, ss: float, duration: float):
 # ---------------------------------------------------------------------------
 
 def detect(src: str, start, end, out_dir: str, step=None,
-           cols=8, rows=8, cell_w=192) -> dict:
+           cols=8, rows=8, cell_w=256) -> dict:
     """Extract frames from [start, end], pack into labeled grid montages, save to out_dir.
 
     Returns a mapping {grid_filename: [frame_numbers]} and saves mapping.json alongside
@@ -341,7 +380,12 @@ def extract_frame(src: str, at, out: str):
                 frame.to_image().save(out)
                 break
     else:
-        _run(["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", src, "-vframes", "1", out])
+        # Use select filter for frame-accurate extraction.
+        # Fast-seek (-ss before -i) snaps to nearest keyframe on B-frame sources (e.g. Grok output),
+        # returning the wrong frame. select= decodes to the exact pts.
+        _run(["ffmpeg", "-y", "-i", src,
+              "-vf", f"select=gte(t\\,{t:.6f})",
+              "-vframes", "1", "-vsync", "0", out])
 
 
 def overlay_text(src: str, out: str, text: str, x: str = "100", y: str = "100",
@@ -460,23 +504,144 @@ def overlay_image(src: str, image: str, out: str, x: str = "0", y: str = "0",
 
 
 def concat(clips: list, out: str):
-    """Concatenate clips with stream copy (no re-encode). All clips must share codec/resolution."""
+    """Concatenate clips. Video stream-copied; audio re-encoded to prevent timestamp drift."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for c in clips:
             f.write(f"file '{os.path.abspath(c)}'\n")
         list_file = f.name
     try:
         _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
-              "-c", "copy", out])
+              "-c:v", "copy", "-c:a", "aac", "-ar", "44100", out])
     finally:
         os.unlink(list_file)
+
+
+def splice(clip_a: str, clip_b: str, out: str, crossfade: float = 0.04):
+    """Join two clips with a short audio+video crossfade. Avoids hard-cut jump."""
+    dur_a = video_info(clip_a)["duration"]
+    offset = max(0.0, dur_a - crossfade)
+    _run(["ffmpeg", "-y", "-i", clip_a, "-i", clip_b,
+          "-filter_complex",
+          f"[0:v][1:v]xfade=transition=fade:duration={crossfade:.4f}:offset={offset:.4f}[v];"
+          f"[0:a][1:a]acrossfade=d={crossfade:.4f}:c1=tri:c2=tri[a]",
+          "-map", "[v]", "-map", "[a]",
+          "-c:v", VCODEC, "-b:v", "8M", out])
+
+
+def overlay_gif(src: str, gif: str, out: str, x: str = "0", y: str = "0",
+                scale: str = None, start: float = None, end: float = None):
+    """Composite an animated GIF or RGBA PNG sequence (looping) onto video.
+
+    GIF transparency: colorkey is applied BEFORE scale because scale converts
+    BGRA→YUV which breaks colorkey color matching. For best results use PNGs
+    with real alpha channel (via overlay_png_seq) instead of GIF colorkey.
+
+    start/end: restrict overlay to a time window using split-sparkle-concat
+    internally to avoid ffmpeg's unreliable enable= expression on GIF streams.
+    """
+    import tempfile, os
+
+    def _build_filt(x_, y_, scale_):
+        # colorkey BEFORE scale to stay in BGRA pixel format
+        ck = "colorkey=0x000000:0.2:0.05"
+        if scale_:
+            return (f"[1:v]setpts=PTS-STARTPTS,{ck},scale={scale_},format=rgba[ov];"
+                    f"[0:v][ov]overlay={x_}:{y_}:format=auto")
+        return (f"[1:v]setpts=PTS-STARTPTS,{ck},format=rgba[ov];"
+                f"[0:v][ov]overlay={x_}:{y_}:format=auto")
+
+    if start is None and end is None:
+        filt = _build_filt(x, y, scale)
+        _run(["ffmpeg", "-y", "-i", src, "-ignore_loop", "0", "-i", gif,
+              "-filter_complex", filt,
+              "-c:v", VCODEC, "-c:a", "copy", "-shortest", out])
+        return
+
+    # Timed window: split source into before/during/after, apply overlay only to middle
+    info = video_info(src)
+    dur = info["duration"]
+    t0 = start if start is not None else 0.0
+    t1 = end if end is not None else dur
+
+    with tempfile.TemporaryDirectory() as td:
+        pa = os.path.join(td, "A.mp4")
+        pb_raw = os.path.join(td, "B_raw.mp4")
+        pb_ov  = os.path.join(td, "B_ov.mp4")
+        pc = os.path.join(td, "C.mp4")
+
+        _run(["ffmpeg", "-y", "-i", src, "-t", f"{t0:.4f}", "-c", "copy", pa])
+        _run(["ffmpeg", "-y", "-i", src, "-ss", f"{t0:.4f}", "-t", f"{t1-t0:.4f}",
+              "-c:v", VCODEC, "-c:a", "aac", pb_raw])
+        _run(["ffmpeg", "-y", "-i", src, "-ss", f"{t1:.4f}",
+              "-c:v", VCODEC, "-c:a", "aac", pc])
+
+        filt = _build_filt(x, y, scale)
+        _run(["ffmpeg", "-y", "-i", pb_raw, "-ignore_loop", "0", "-i", gif,
+              "-filter_complex", filt,
+              "-c:v", VCODEC, "-c:a", "copy", "-shortest", pb_ov])
+
+        # Concat A + B_overlay + C
+        parts = [p for p in [pa, pb_ov, pc] if os.path.exists(p) and
+                 video_info(p)["duration"] > 0.01]
+        n = len(parts)
+        inputs = []
+        for p in parts:
+            inputs += ["-i", p]
+        streams = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+        _run(["ffmpeg", "-y"] + inputs +
+             ["-filter_complex", f"{streams}concat=n={n}:v=1:a=1[v][a]",
+              "-map", "[v]", "-map", "[a]",
+              "-c:v", VCODEC, "-b:v", "8M", "-c:a", "aac", "-ar", "44100", out])
+
+
+def position_grid(src: str, at, out: str, spacing: int = 100):
+    """Extract a frame and draw a pixel-coordinate grid — use to plan overlay positions.
+
+    Every grid intersection is labelled with its (x,y) coordinates so you can read
+    positions without tracing back to the edges.  Edge ticks use a slightly larger font.
+    Spacing auto-scales the font so labels stay legible at small spacing values.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    tmp = out + ".raw.png"
+    extract_frame(src, at, tmp)
+    img = Image.open(tmp).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    edge_font = ImageFont.load_default(size=max(10, min(16, spacing // 6)))
+    inner_font = ImageFont.load_default(size=max(8, min(12, spacing // 8)))
+
+    # Draw grid lines
+    for xi in range(0, w + 1, spacing):
+        draw.line([(xi, 0), (xi, h)], fill=(0, 0, 0), width=3)
+        draw.line([(xi, 0), (xi, h)], fill=(0, 255, 128), width=1)
+    for yi in range(0, h + 1, spacing):
+        draw.line([(0, yi), (w, yi)], fill=(0, 0, 0), width=3)
+        draw.line([(0, yi), (w, yi)], fill=(0, 255, 128), width=1)
+
+    # Edge tick labels (x along top, y along left)
+    for xi in range(spacing, w + 1, spacing):
+        draw.text((xi + 2, 4), str(xi), fill=(0, 0, 0), font=edge_font)
+        draw.text((xi + 1, 3), str(xi), fill=(0, 255, 128), font=edge_font)
+    for yi in range(spacing, h + 1, spacing):
+        draw.text((4, yi + 2), str(yi), fill=(0, 0, 0), font=edge_font)
+        draw.text((3, yi + 1), str(yi), fill=(0, 255, 128), font=edge_font)
+
+    # Intersection labels: every crossing gets "(x,y)" so any interior point is readable
+    for xi in range(spacing, w, spacing):
+        for yi in range(spacing, h, spacing):
+            label = f"{xi},{yi}"
+            draw.text((xi + 2, yi + 2), label, fill=(0, 0, 0), font=inner_font)
+            draw.text((xi + 1, yi + 1), label, fill=(0, 255, 128), font=inner_font)
+
+    img.save(out)
+    os.unlink(tmp)
 
 
 # ---------------------------------------------------------------------------
 # Grok video editing
 # ---------------------------------------------------------------------------
 
-GROK_MAX_SECONDS = 5.0  # Balance between drift-per-chunk and seam count
+GROK_MAX_SECONDS = 8.0  # Balance between drift-per-chunk and seam count
 
 # Constraint prefix appended to every grok-edit prompt to prevent style changes.
 _GROK_CONSTRAINT = (
@@ -653,7 +818,7 @@ def main():
                    help="frame interval: integer=frame count, float<1=seconds (e.g. 0.05=50ms). Default: 0.1s")
     d.add_argument("--cols", type=int, default=8)
     d.add_argument("--rows", type=int, default=8)
-    d.add_argument("--cell-w", type=int, default=192)
+    d.add_argument("--cell-w", type=int, default=256)
 
     inf = sub.add_parser("info", help="print video metadata (fps, resolution, duration, frames, codec)")
     inf.add_argument("src")
@@ -665,6 +830,16 @@ def main():
                     help="output one word per line with precise timestamps (use for cut-point editing)")
     tr.add_argument("--model", default="mlx-community/whisper-large-v3-turbo",
                     help="mlx-whisper model repo")
+    tr.add_argument("--clean", action="store_true",
+                    help="let whisper drop disfluencies (um/uh); default is verbatim, keeping them")
+
+    ss = sub.add_parser("speech-segments",
+                        help="speech/silence spans via silencedetect (find isolated fillers reliably)")
+    ss.add_argument("src")
+    ss.add_argument("--noise", type=float, default=-30.0,
+                    help="silence threshold in dB (default -30; quieter rooms: -35 to -40)")
+    ss.add_argument("--min-silence", type=float, default=0.15,
+                    help="minimum silence duration in seconds (default 0.15)")
 
     ge = sub.add_parser("grok-edit", help="edit video with Grok AI; use --splice-into to embed result back in source")
     ge.add_argument("src")
@@ -726,6 +901,28 @@ def main():
     oi.add_argument("--start", type=float, default=None)
     oi.add_argument("--end",   type=float, default=None)
 
+    og = sub.add_parser("overlay-gif", help="composite an animated GIF (looping) onto video")
+    og.add_argument("src")
+    og.add_argument("--gif", required=True, help="animated GIF file")
+    og.add_argument("-o", "--out", required=True)
+    og.add_argument("--x", default="0")
+    og.add_argument("--y", default="0")
+    og.add_argument("--scale", default=None, help="resize gif first e.g. '200:200'")
+    og.add_argument("--start", type=float, default=None)
+    og.add_argument("--end",   type=float, default=None)
+
+    pg = sub.add_parser("position-grid", help="extract frame with pixel coordinate grid for planning overlay positions")
+    pg.add_argument("src")
+    pg.add_argument("--at", type=float, required=True, help="timestamp in seconds")
+    pg.add_argument("-o", "--out", required=True, help="output PNG")
+    pg.add_argument("--spacing", type=int, default=100, help="grid spacing in pixels (default 100)")
+
+    sp = sub.add_parser("splice", help="join two clips with audio+video crossfade (no hard cut)")
+    sp.add_argument("clip_a")
+    sp.add_argument("clip_b")
+    sp.add_argument("-o", "--out", required=True)
+    sp.add_argument("--crossfade", type=float, default=0.04, help="crossfade duration in seconds (default 0.04)")
+
     a = p.parse_args()
 
     if a.cmd == "info":
@@ -741,10 +938,19 @@ def main():
     elif a.cmd == "transcribe":
         import mlx_whisper
         print("transcribing…", flush=True)
+        # Verbatim by default: whisper silently cleans hesitation sounds (um/uh) otherwise,
+        # which breaks filler-removal. Seed the decoder with only short disfluencies so it
+        # keeps them — a broader list (like/so/basically) over-biases toward real words.
+        # --clean restores whisper's default behavior.
+        verbatim_kwargs = {} if a.clean else dict(
+            condition_on_previous_text=False,
+            initial_prompt="Um, uh, er, hmm...",
+        )
         result = mlx_whisper.transcribe(
             a.src,
             path_or_hf_repo=a.model,
             word_timestamps=True,
+            **verbatim_kwargs,
         )
         lines = []
         if a.words:
@@ -763,6 +969,12 @@ def main():
             print(f"saved {len(lines)} segments to {a.out}")
         else:
             print(text)
+
+    elif a.cmd == "speech-segments":
+        spans = speech_segments(a.src, noise_db=a.noise, min_silence=a.min_silence)
+        print(f"# kind\tstart\tend\tdur  (noise={a.noise}dB, min_silence={a.min_silence}s)")
+        for s0, s1, kind in spans:
+            print(f"{kind}\t{s0:.3f}\t{s1:.3f}\t{s1 - s0:.3f}")
 
     elif a.cmd == "yt-dl":
         import yt_dlp
@@ -819,6 +1031,19 @@ def main():
     elif a.cmd == "overlay-image":
         overlay_image(a.src, a.image, a.out, x=a.x, y=a.y,
                       scale=a.scale, start=a.start, end=a.end)
+        print(a.out)
+
+    elif a.cmd == "overlay-gif":
+        overlay_gif(a.src, a.gif, a.out, x=a.x, y=a.y,
+                    scale=a.scale, start=a.start, end=a.end)
+        print(a.out)
+
+    elif a.cmd == "position-grid":
+        position_grid(a.src, a.at, a.out, spacing=a.spacing)
+        print(a.out)
+
+    elif a.cmd == "splice":
+        splice(a.clip_a, a.clip_b, a.out, crossfade=a.crossfade)
         print(a.out)
 
 

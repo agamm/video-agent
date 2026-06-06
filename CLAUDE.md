@@ -2,6 +2,25 @@
 
 **Refresh this file whenever `video_agent.py` changes.**
 
+## Skills — deep procedures live here, not in this file
+
+Workflows and ffmpeg techniques with non-obvious gotchas are documented as skills (in
+`.claude/skills/`) so the procedure + its gotchas surface at the moment they're relevant.
+A technique that's just a one-line ffmpeg invocation lives in a skill, **not** a CLI command
+— commands are reserved for operations needing real code. Invoke the matching skill when:
+
+- **`filler-removal`** — removing um/uh/filler words from speech.
+- **`grok-video-edit`** — AI edits that reimagine footage (recolor, add smoke/fire/glow, restyle).
+- **`video-overlay`** — compositing text/image/animated graphics onto video, and placing
+  them accurately (including locking to a face/eye/moving subject).
+- **`video-transitions`** — joining two clips with a visible transition (wipe/slide/dissolve/
+  pixelize/circle/fade-to-black) via ffmpeg `xfade`.
+- **`audio-edit`** — normalizing loudness, denoising hiss/hum, or mixing background music
+  (with ducking under speech).
+
+This file keeps the always-needed command reference, ffmpeg cheatsheet, and universal
+pitfalls.
+
 ## Setup
 ```bash
 uv sync
@@ -11,121 +30,78 @@ uv sync
 
 ---
 
-## Our CLI tools
+## Our CLI tools (command reference)
 
-### info — video metadata
+Position values everywhere: **bare integer = frame number; float or `HH:MM:SS` = seconds.**
+Wrong: `--start 120` (= frame 120). Correct: `--start 120.0` or `--start 00:02:00`.
+
 ```bash
+# info — metadata (CHECK CODEC FIRST: AV1 can't be ffmpeg-decoded; primitives route via PyAV)
 uv run video-agent info video.mp4
-# duration:   424.433s
-# fps:        30.0
-# resolution: 1920x1080
-# frames:     12733
-# codec:      av1  ← ffmpeg cannot decode; trim/frame/detect use PyAV
-```
-**Check codec first.** AV1 (from YouTube downloads) can't be decoded by ffmpeg — all
-primitives (trim/frame/detect/grok-edit) route through PyAV automatically, but knowing
-the codec upfront avoids surprises.
+#   duration / fps / resolution / frames / codec
 
-### transcribe — speech to text with timestamps
-```bash
-uv run video-agent transcribe video.mp4              # print to stdout
-uv run video-agent transcribe video.mp4 -o out.txt   # save to file
-```
-Output format: `[MM:SS.ss --> MM:SS.ss]  text` per segment.
-Uses mlx-whisper (Apple Silicon, fast). Model downloads on first run (~1.5GB).
+# transcribe — speech to text (mlx-whisper, Apple Silicon; model ~1.5GB on first run)
+uv run video-agent transcribe video.mp4 [-o out.txt]      # [MM:SS.ss --> MM:SS.ss] text
+uv run video-agent transcribe video.mp4 --words -o w.txt  # start_sec  end_sec  word
+#   USE FOR: *what* was said — find a filler by name, read content, subtitles. Word times
+#   jitter ±0.3-0.7s (and shift between runs) → NEVER cut on them; pair with speech-segments
+#   (WHERE) to place the actual cut. Verbatim by default — keeps um/uh hesitations (seeds the
+#   decoder with a short filler prompt); --clean drops disfluencies. See filler-removal skill.
 
-**Workflow — remove filler words (iterate until perfect):**
+# speech-segments — speech/silence spans via silencedetect (inverts silence → speech)
+uv run video-agent speech-segments video.mp4   # kind  start  end  dur  (tab-separated)
+#   USE FOR: *where* sound starts/stops (frame-accurate) — cut points & safe crossfade spots.
+#   --noise -30 (dB threshold; quieter rooms -35..-40), --min-silence 0.15 (s).
+#   An isolated filler ("um") = a lone speech burst between two silences; trust this burst's
+#   boundaries for the cut, not the jittery whisper word timestamp.
+#   Together: transcribe = WHAT (which word to cut) · speech-segments = WHERE (the exact edge).
 
-```bash
-# Step 1: get word-level timestamps (essential — segment timestamps are too imprecise)
-uv run video-agent transcribe video.mp4 --words -o words.txt
-# output: start_sec  end_sec  word  (one per line, tab-separated)
-```
-
-**Cutting rules (follow exactly):**
-- Cut from **word_start - 0.05s** to **word_end + 0.15s** (50ms lead-in, 150ms trail)
-  — the trail prevents clipping the consonant that follows the filler
-- Never cut closer than 0.1s to a non-filler word on either side
-- If two fillers are within 0.3s of each other, merge them into one cut
-
-**Iteration loop — do not stop until clean:**
-1. Find all filler words (um, uh, like, you know, basically, literally) in words.txt
-2. For each cut: extract a **3-second splice preview** around the join point:
-   ```bash
-   ffmpeg -ss <join_time - 1.5> -i draft.mp4 -t 3 preview_cut_N.mp4
-   ```
-3. Read each preview clip (use Read tool or open it) — listen/watch for:
-   - Abrupt audio jump → increase trail padding by 0.05s, redo that cut
-   - Missing word start → decrease lead-in by 0.05s, redo that cut
-   - Sounds natural → mark cut as approved
-4. Only approved cuts go into the final concat
-5. After concat, **re-transcribe the output** and check no non-filler speech was removed
-6. If any real speech is missing → restore that cut from the original, iterate again
-7. Done when: all previews sound natural AND re-transcription matches intent
-
-### yt-dl — download video
-```bash
+# yt-dl — download (yt-dlp backend)
 uv run video-agent yt-dl "https://youtube.com/watch?v=..." -o inputs/
-uv run video-agent yt-dl "https://youtube.com/watch?v=..." -o inputs/clip.mp4
-```
 
-### detect — build grid montages for visual frame search
-```bash
-uv run video-agent detect video.mp4 --start 0 --end 60 -o grids/
-uv run video-agent detect video.mp4 --start 00:01:00 --end 00:02:00 -o grids/
-```
-Outputs: `grids/grid_000.png`, `grid_001.png`, ... + `mapping.json`
+# detect — grid montages for visual frame search → grids/grid_NNN.png + mapping.json
+uv run video-agent detect video.mp4 --start 0.0 --end 60.0 -o grids/
+#   mapping.json: {"grid_000.png":[0,3,6,...]} → cell index N maps to that frame number.
+#   For Grok boundary-finding use --step 1 --cell-w 384.
+#   ALWAYS use detect (NOT repeated `frame` calls) to scan/search ANY time range or find a
+#   gesture/wink/cut. It reads sequentially (frame-accurate, no seeking) and builds the
+#   montage for you in one pass — never hand-roll a montage from many `frame` extractions.
+#   Coarse-to-fine: a wide grid to locate the region, then --step 1 to nail exact frames.
+#   Once detect locates the moment, it's fine to re-extract that frame full-res with `frame`
+#   to zoom in for detail (grid cells are downscaled). detect = scan; frame = inspect.
 
-**Position values: bare integer = frame number; float or HH:MM:SS = seconds.**
-Wrong: `--start 120` (= frame 120 = 5s at 24fps). Correct: `--start 120.0` or `--start 00:02:00`.
-
-**Workflow in Claude Code:**
-1. Run detect to build grids
-2. Read each grid image with the Read tool
-3. Note cell indices matching your criteria
-4. Read `grids/mapping.json` → convert cell index → frame number
-```json
-{"grid_000.png": [0, 3, 6, 9, ...], "grid_001.png": [192, 195, ...]}
-```
-Cell index 2 in `grid_000.png` = frame 6, and so on.
-
-### trim — extract a time range (codec-universal)
-```bash
+# trim — extract a time range (codec-universal, handles AV1)
 uv run video-agent trim video.mp4 --start 10.0 --end 30.0 -o clip.mp4
-```
-Handles AV1 automatically (PyAV → h264_videotoolbox pipe).
 
-### frame — extract a single frame (codec-universal)
-```bash
+# frame — extract ONE known frame (codec-universal, frame-accurate)
 uv run video-agent frame video.mp4 --at 45.5 -o frame.png
-```
+#   Use only when you already know the exact timestamp. To SCAN a range, use detect instead.
 
-### concat — join clips (stream copy, no re-encode)
-```bash
+# concat — join clips (stream copy; all clips must share codec+resolution)
 uv run video-agent concat a.mp4 b.mp4 c.mp4 -o out.mp4
-```
-All clips must share codec and resolution. Use `trim` first if mixing sources.
+#   Do NOT use after a re-encoded/Grok/overlay segment — use filter_complex concat instead.
 
-### overlay-text — burn text onto video (no AI, deterministic)
-```bash
-uv run video-agent overlay-text in.mp4 --text "BOOM!" \
-    --x center --y center --size 120 --color yellow \
-    --start 5.0 --end 7.0 -o out.mp4
-```
-- `--x` / `--y`: pixel offset or `center` (horizontal/vertical center)
-- `--color`: white | yellow | red | black
-- `--start` / `--end`: optional seconds to show/hide (omit = always visible)
-- Uses PIL for text rendering (mise ffmpeg lacks libfreetype/drawtext)
+# overlay-text / overlay-texts — burn text (PIL; mise ffmpeg lacks drawtext)
+uv run video-agent overlay-text in.mp4 --text "BOOM!" --x center --y center \
+    --size 120 --color yellow --start 5.0 --end 7.0 -o out.mp4
+#   --color: white|yellow|red|black ; --start/--end optional (omit = always visible)
 
-### overlay-image — composite image onto video (no AI, deterministic)
-```bash
-uv run video-agent overlay-image in.mp4 --image logo.png \
-    --x "W-w-20" --y 20 --scale 200:100 \
-    --start 0.0 --end 5.0 -o out.mp4
+# overlay-image / overlay-gif — composite image or animated GIF
+uv run video-agent overlay-image in.mp4 --image logo.png --x "W-w-20" --y 20 \
+    --scale 200:100 --start 0.0 --end 5.0 -o out.mp4
+#   For transparency / animated effects see the video-overlay skill (use RGBA PNG seq, not GIF).
+
+# position-grid — frame with labelled (x,y) coordinate grid for planning overlays
+uv run video-agent position-grid video.mp4 --at 14.2 --spacing 200 -o grid.png
+#   Start at spacing 200 (100 is too dense to read). See video-overlay skill for the
+#   crop-zoom + compute-don't-eyeball positioning workflow.
+
+# grok-edit — AI edit (see grok-video-edit skill; always trim target region first)
+uv run video-agent grok-edit clip.mp4 --prompt "Make the lenses solid red" -o out.mp4
+
+# splice — join two clips with audio+video crossfade (no hard cut)
+uv run video-agent splice a.mp4 b.mp4 -o out.mp4
 ```
-- `--x` / `--y`: pixel offset or ffmpeg expressions (`W-w-10` = 10px from right edge)
-- `--scale WxH`: resize image before overlaying (e.g. `320:180`)
-- `--start` / `--end`: optional window (omit = always visible)
 
 ---
 
@@ -143,58 +119,11 @@ va.extract_frame(src, at, out)
 va.concat(clips, out)
 ```
 
-Position values: bare integer = frame number; float or `HH:MM:SS` = seconds.
-
----
-
-## xAI / Grok video editing
-
-```bash
-# Edit a clip standalone
-uv run video-agent grok-edit clip.mp4 --prompt "Make the sunglasses lenses solid red" -o out.mp4
-
-# Edit a section of a larger video and splice it back in (PREFERRED)
-uv run video-agent grok-edit source.mp4 --prompt "Make the butterfly red and sparkly" \
-    --splice-into source.mp4 --splice-start 99.0 --splice-end 112.0 \
-    -o final.mp4
-```
-
-**Always splice back when editing a section of a longer video.**
-The typical flow: detect a region → grok-edit that region with `--splice-into` → done.
-Without `--splice-into` you get only the edited clip, not the full video with the edit applied.
-
-Automatically handles: chunking, base64 upload (no tunnel), concat, original audio stitch.
-Requires `XAI_API_KEY` in `.env`. Chunks downscaled to 720p/2Mbps (gRPC 4MB limit).
-**AV1 sources** handled automatically (PyAV decode → h264 chunks).
-
-**Chunk size** (`GROK_MAX_SECONDS = 5.0` in code): each chunk is edited independently —
-Grok reimagines the scene fresh each time. Shorter chunks = more seams/style jumps.
-5s is the best balance. Do NOT go below 3s.
-
-**Boundary detection** — before grok-edit, run `detect` with `--step 1 --cell-w 384`
-inside the rough window to find frame-exact first/last frames of the subject. Trim
-to those exact boundaries so Grok doesn't see irrelevant context.
-
-**Shot boundaries** — split chunks at natural scene cuts, not arbitrary time intervals.
-Use the detect grid to identify cuts, then trim each shot separately. A chunk that
-spans a shot change will have the second shot reimagined in a different style.
-
-**Character drift** — Grok cannot maintain character consistency between chunks.
-The system constraint (`_GROK_CONSTRAINT`) is generic and should stay that way.
-Pass character descriptions in the user prompt, not the constraint.
-
-**Audio** — Grok outputs video only. For the final assembly, always rebuild the audio
-track from the original source: extract with ffmpeg (`-vn -c:a copy`), then mux onto
-the assembled video track. Never rely on PyAV-trimmed audio for sync.
-
-**Prompt tips:**
-- Say what to change, not what to keep — Grok ignores negative constraints better than positive ones
-- Avoid "shockwave rings", "portal effects" etc. unless you want them — Grok adds them literally
-- For color-only changes describe the exact color to replace and target color
-
 ---
 
 ## ffmpeg — use directly for all editing
+
+macOS encoder: `h264_videotoolbox`. Linux: `libx264`.
 
 ```bash
 # Info
@@ -209,12 +138,19 @@ ffmpeg -ss 30 -i in.mp4 -c:v h264_videotoolbox -c:a aac part2.mp4
 printf "file 'part1.mp4'\nfile 'part2.mp4'\n" > /tmp/list.txt
 ffmpeg -f concat -safe 0 -i /tmp/list.txt -c copy out.mp4
 
-# Concat clips
+# Concat clips (stream copy — only when all share codec and start on keyframes)
 printf "file 'a.mp4'\nfile 'b.mp4'\nfile 'c.mp4'\n" > /tmp/list.txt
 ffmpeg -f concat -safe 0 -i /tmp/list.txt -c copy out.mp4
 
-# Extract a frame
+# Concat after any re-encode/filter (re-encodes — avoids freeze frames + drift)
+ffmpeg -i a.mp4 -i b.mp4 \
+  -filter_complex "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]" \
+  -map "[v]" -map "[a]" -c:v h264_videotoolbox -b:v 8M -c:a aac -ar 44100 out.mp4
+
+# Extract a frame (by frame number — accurate)
 ffmpeg -i in.mp4 -vf "select=eq(n\,90)" -vsync 0 -frames:v 1 frame.png
+# Extract a frame (by timestamp — accurate; -ss AFTER -i, not before)
+ffmpeg -i in.mp4 -vf "select=gte(t\,3.07)" -vframes 1 -vsync 0 frame.png
 
 # Picture-in-picture
 ffmpeg -i main.mp4 -i pip.mp4 \
@@ -239,21 +175,37 @@ ffmpeg -i in.mp4 -vf "crop=1080:1080:420:0" -c:v h264_videotoolbox out.mp4
 # Resize
 ffmpeg -i in.mp4 -vf "scale=1280:720" -c:v h264_videotoolbox out.mp4
 
-# Mute
+# Mute / replace audio
 ffmpeg -i in.mp4 -an -c:v copy out.mp4
-
-# Replace audio
 ffmpeg -i in.mp4 -i audio.mp3 -map 0:v -map 1:a -c:v copy -shortest out.mp4
 
 # Color grade
 ffmpeg -i in.mp4 -vf "eq=brightness=0.05:contrast=1.1:saturation=1.2" -c:v h264_videotoolbox out.mp4
-
-# Transcribe (Apple Silicon)
-uv run --with mlx-whisper python3 -c "
-import mlx_whisper
-r = mlx_whisper.transcribe('video.mp4', path_or_hf_repo='mlx-community/whisper-large-v3-turbo', word_timestamps=True)
-for s in r['segments']: print(f\"[{s['start']:.2f}s] {s['text'].strip()}\")
-"
 ```
 
-macOS encoder: `h264_videotoolbox`. Linux: `libx264`.
+---
+
+## Universal pitfalls (apply to every task)
+
+### Frame extraction accuracy
+**Fast seeking gives wrong frames on B-frame sources.** `ffmpeg -ss T -i src` (seek before
+input) snaps to the nearest keyframe — 1–3s off on H.264 B-frame video (Grok output, OBS
+recordings). The extracted frame is NOT what plays at T.
+
+`extract_frame` and `position-grid` use `select=gte(t,T)` and are frame-accurate. In raw
+ffmpeg, put `-ss` **after** `-i`, or use the select filter:
+```bash
+ffmpeg -i in.mp4 -vf "select=gte(t\,3.07)" -vframes 1 -vsync 0 frame.png
+```
+**Symptom of bad seek:** extracted frame shows the wrong moment (subject in a different
+position). Cross-check with `detect` (reads sequentially, no seeking) if a frame looks off.
+
+### Audio / video assembly
+- **Stream-copy concat fails silently at non-keyframe boundaries.** After any re-encoded
+  segment (Grok, splice, overlay), stream-copy concat may freeze at the seam. Use
+  filter_complex concat (re-encodes) for the final join when any input went through a filter.
+- **Re-encode audio in concat to prevent drift.** `-c copy` accumulates per-clip timestamp
+  offsets across many clips. Always `-c:a aac -ar 44100` in the final concat.
+- **Verify timing by dumping frames sequentially.** `ffmpeg -i out.mp4 -vf fps=10
+  /tmp/f_%03d.png` gives reliable frame-to-timestamp correspondence — better than a single
+  seeked frame for auditing cut/overlay timing on re-encoded sources.

@@ -18,5 +18,6 @@ grids/
 *.jpeg
 *.gif
 
-# claude code
-.claude/
+# claude code — keep skills tracked, ignore local state
+.claude/*
+!.claude/skills/
