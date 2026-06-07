@@ -122,6 +122,83 @@ def speech_segments(path: str, noise_db: float = -30.0,
     return spans
 
 
+def whisper_segments(src: str, model: str = "mlx-community/whisper-large-v3-turbo",
+                     clean: bool = False) -> list:
+    """Transcribe `src` and return whisper segments (each: {start, end, text, words}).
+
+    Verbatim by default (keeps um/uh) — see the `transcribe` command for the rationale.
+    Shared by the transcribe and captions commands.
+    """
+    import mlx_whisper
+    verbatim_kwargs = {} if clean else dict(
+        condition_on_previous_text=False,
+        initial_prompt="Um, uh, er, hmm...",
+    )
+    return mlx_whisper.transcribe(
+        src, path_or_hf_repo=model, word_timestamps=True, **verbatim_kwargs,
+    )["segments"]
+
+
+def _srt_timestamp(t: float, sep: str = ",") -> str:
+    """Seconds → SRT/VTT timestamp HH:MM:SS,mmm (sep=',' SRT, '.' VTT)."""
+    if t < 0:
+        t = 0.0
+    ms = int(round(t * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
+
+
+def format_srt(segments: list) -> str:
+    """Render whisper segments as a SubRip (.srt) document."""
+    blocks = []
+    for i, seg in enumerate((s for s in segments if s["text"].strip()), start=1):
+        blocks.append(
+            f"{i}\n"
+            f"{_srt_timestamp(seg['start'])} --> {_srt_timestamp(seg['end'])}\n"
+            f"{seg['text'].strip()}"
+        )
+    return "\n\n".join(blocks) + "\n"
+
+
+def parse_subtitles(path: str) -> list:
+    """Parse a .srt or .vtt file into segments [{start, end, text}, …]."""
+    import re
+    txt = open(path, encoding="utf-8").read()
+    segs = []
+    pat = re.compile(
+        r"(\d{1,2}:\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{3})(.*?)"
+        r"(?=\n\s*\n|\n\s*\d{1,2}:\d{2}:\d{2}[.,]\d{3}|\Z)",
+        re.DOTALL,
+    )
+
+    def _sec(ts: str) -> float:
+        ts = ts.replace(",", ".")
+        h, m, s = ts.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+
+    for m in pat.finditer(txt):
+        text = " ".join(line.strip() for line in m.group(3).strip().splitlines()
+                        if line.strip())
+        if text:
+            segs.append({"start": _sec(m.group(1)), "end": _sec(m.group(2)), "text": text})
+    return segs
+
+
+def format_vtt(segments: list) -> str:
+    """Render whisper segments as a WebVTT (.vtt) document."""
+    blocks = ["WEBVTT"]
+    for seg in segments:
+        if not seg["text"].strip():
+            continue
+        blocks.append(
+            f"{_srt_timestamp(seg['start'], '.')} --> {_srt_timestamp(seg['end'], '.')}\n"
+            f"{seg['text'].strip()}"
+        )
+    return "\n\n".join(blocks) + "\n"
+
+
 def to_seconds(value, fps: float) -> float:
     """Frame number or timestamp → seconds. Bare integer = frame number."""
     if isinstance(value, int):
@@ -474,25 +551,110 @@ def overlay_texts(src: str, out: str,
         enables.append(f"between(t,{t0},{t1})")
 
     try:
-        # Build filter_complex: chain overlays one after another
-        inputs = ["-i", src]
+        _overlay_timed_pngs(src, pngs, enables, out)
+    finally:
         for p in pngs:
-            inputs += ["-i", p]
+            os.unlink(p)
 
-        # [0:v][1:v]overlay=0:0:enable=...[v1]; [v1][2:v]overlay=0:0:enable=...[v2]; ...
-        chain = []
-        prev = "0:v"
-        for i, enable in enumerate(enables):
-            label_out = f"v{i+1}" if i < len(enables) - 1 else "vout"
-            chain.append(f"[{prev}][{i+1}:v]overlay=0:0:enable='{enable}'[{label_out}]")
-            prev = label_out
-        filt = ";".join(chain)
 
-        _run(["ffmpeg", "-y"] + inputs + [
-            "-filter_complex", filt,
-            "-map", "[vout]", "-map", "0:a?",
-            "-c:v", VCODEC, "-c:a", "copy", out
-        ])
+def _overlay_timed_pngs(src: str, pngs: list, enables: list, out: str):
+    """Overlay N full-frame RGBA PNGs onto `src`, each gated by an `enable` expr, one pass.
+
+    Shared by overlay_texts and burn_captions. Video is re-encoded (overlay filter); audio
+    is stream-copied. With no PNGs it just re-muxes the source.
+    """
+    if not pngs:
+        _run(["ffmpeg", "-y", "-i", src, "-c:v", VCODEC, "-c:a", "copy", out])
+        return
+    inputs = ["-i", src]
+    for p in pngs:
+        inputs += ["-i", p]
+    # [0:v][1:v]overlay=0:0:enable=...[v1]; [v1][2:v]overlay=0:0:enable=...[v2]; ...
+    chain = []
+    prev = "0:v"
+    for i, enable in enumerate(enables):
+        label_out = f"v{i+1}" if i < len(enables) - 1 else "vout"
+        chain.append(f"[{prev}][{i+1}:v]overlay=0:0:enable='{enable}'[{label_out}]")
+        prev = label_out
+    _run(["ffmpeg", "-y"] + inputs + [
+        "-filter_complex", ";".join(chain),
+        "-map", "[vout]", "-map", "0:a?",
+        "-c:v", VCODEC, "-c:a", "copy", out,
+    ])
+
+
+def _wrap_lines(draw, text: str, font, max_w: int) -> list:
+    """Greedy word-wrap `text` so each line's rendered width ≤ max_w (PIL)."""
+    lines, cur = [], ""
+    for word in text.split():
+        trial = f"{cur} {word}".strip()
+        if cur and draw.textlength(trial, font=font) > max_w:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = trial
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def burn_captions(src: str, out: str, segments: list, size: int = None,
+                  color: str = "white", position: str = "bottom", box: bool = True):
+    """Burn subtitle segments into `src` (PIL render → ffmpeg overlay; no drawtext needed).
+
+    segments: list of {start, end, text} (whisper segments work directly). Each caption is
+    word-wrapped to ~90% of frame width, centered horizontally, with an optional
+    semi-transparent background box for legibility. position: bottom|top|center.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    info = video_info(src)
+    W, H = info["width"], info["height"]
+    if size is None:
+        size = max(16, round(H * 0.05))          # ~5% of frame height
+    font = ImageFont.load_default(size=size)
+    r, g, b = {"white": (255, 255, 255), "yellow": (255, 255, 0),
+               "red": (255, 0, 0), "black": (0, 0, 0)}.get(color, (255, 255, 255))
+    max_w = int(W * 0.9)
+    line_h = size + round(size * 0.35)
+    pad = round(size * 0.3)
+
+    pngs, enables = [], []
+    for seg in segments:
+        text = seg["text"].strip()
+        if not text:
+            continue
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        lines = _wrap_lines(draw, text, font, max_w)
+        block_h = line_h * len(lines)
+        if position == "top":
+            y0 = round(H * 0.06)
+        elif position == "center":
+            y0 = (H - block_h) // 2
+        else:                                    # bottom
+            y0 = H - block_h - round(H * 0.08)
+
+        if box:
+            widest = max(draw.textlength(ln, font=font) for ln in lines)
+            bx0 = int((W - widest) // 2 - pad)
+            bx1 = int((W + widest) // 2 + pad)
+            draw.rectangle([bx0, y0 - pad, bx1, y0 + block_h + pad // 2],
+                           fill=(0, 0, 0, 140))
+
+        for i, line in enumerate(lines):
+            lw = draw.textlength(line, font=font)
+            lx, ly = (W - lw) // 2, y0 + i * line_h
+            draw.text((lx + 2, ly + 2), line, font=font, fill=(0, 0, 0, 200))
+            draw.text((lx, ly), line, font=font, fill=(r, g, b, 255))
+
+        f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        img.save(f.name); f.close()
+        pngs.append(f.name)
+        enables.append(f"between(t,{seg['start']:.3f},{seg['end']:.3f})")
+
+    try:
+        _overlay_timed_pngs(src, pngs, enables, out)
     finally:
         for p in pngs:
             os.unlink(p)
@@ -644,6 +806,59 @@ def position_grid(src: str, at, out: str, spacing: int = 100):
 
     img.save(out)
     os.unlink(tmp)
+
+
+def reframe(src: str, out: str, aspect: str = "9:16", mode: str = "crop",
+            focus: float = 0.5, width: int = None):
+    """Reframe video to a target aspect ratio (e.g. 9:16 reels, 1:1, 4:5).
+
+    mode="crop" (default): crop to fill the target aspect — full-bleed, loses the edges.
+      `focus` (0..1) biases the crop along the cut axis: 0=left/top, 0.5=center, 1=right/
+      bottom. Use it to keep an off-center speaker in frame (no face tracking — set it from
+      a `position-grid` read). To follow a *moving* subject, see the reframe skill.
+    mode="pad": fit the whole frame inside the target canvas, filling the gaps with a
+      blurred zoom of the footage (the ubiquitous TikTok/IG look) — nothing is cropped.
+    width: optional final scale (output width in px; height follows the aspect).
+    """
+    info = video_info(src)
+    W, H = info["width"], info["height"]
+    aw, ah = (float(x) for x in aspect.split(":"))
+    r = aw / ah                                  # target width / height
+    focus = min(max(focus, 0.0), 1.0)
+
+    if mode == "crop":
+        if W / H > r:                            # source too wide → crop width
+            new_w, new_h = round(H * r), H
+        else:                                    # source too tall → crop height
+            new_w, new_h = W, round(W / r)
+        new_w -= new_w % 2
+        new_h -= new_h % 2
+        x = round(focus * (W - new_w))
+        y = round(focus * (H - new_h))
+        vf = f"crop={new_w}:{new_h}:{x}:{y}"
+        if width:
+            vf += f",scale={width}:-2"
+        _run(["ffmpeg", "-y", "-i", src, "-vf", vf,
+              "-c:v", VCODEC, "-c:a", "aac", out])
+    elif mode == "pad":
+        if W / H > r:                            # canvas grows taller
+            out_w, out_h = W, round(W / r)
+        else:                                    # canvas grows wider
+            out_w, out_h = round(H * r), H
+        out_w -= out_w % 2
+        out_h -= out_h % 2
+        if width:
+            out_h = round(width * out_h / out_w)
+            out_w = width
+            out_h -= out_h % 2
+        vf = (f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+              f"crop={out_w}:{out_h},gblur=sigma=20[bg];"
+              f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[fg];"
+              f"[bg][fg]overlay=(W-w)/2:(H-h)/2")
+        _run(["ffmpeg", "-y", "-i", src, "-filter_complex", vf,
+              "-c:v", VCODEC, "-c:a", "aac", out])
+    else:
+        raise ValueError(f"unknown reframe mode {mode!r}; use 'crop' or 'pad'")
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +1070,8 @@ def main():
     tr.add_argument("-o", "--out", default=None, help="output .txt file (default: print to stdout)")
     tr.add_argument("--words", action="store_true",
                     help="output one word per line with precise timestamps (use for cut-point editing)")
+    tr.add_argument("--srt", action="store_true", help="output SubRip (.srt) subtitles")
+    tr.add_argument("--vtt", action="store_true", help="output WebVTT (.vtt) subtitles")
     tr.add_argument("--model", default="mlx-community/whisper-large-v3-turbo",
                     help="mlx-whisper model repo")
     tr.add_argument("--clean", action="store_true",
@@ -953,6 +1170,28 @@ def main():
     sp.add_argument("-o", "--out", required=True)
     sp.add_argument("--crossfade", type=float, default=0.04, help="crossfade duration in seconds (default 0.04)")
 
+    cap = sub.add_parser("captions", help="burn subtitles into video (auto-transcribe or from --srt)")
+    cap.add_argument("src")
+    cap.add_argument("-o", "--out", required=True)
+    cap.add_argument("--srt", default=None, metavar="FILE",
+                     help="use an existing .srt/.vtt file instead of auto-transcribing")
+    cap.add_argument("--size", type=int, default=None, help="font size in px (default ~5%% of height)")
+    cap.add_argument("--color", default="white", help="white|yellow|red|black")
+    cap.add_argument("--position", default="bottom", choices=["bottom", "top", "center"])
+    cap.add_argument("--no-box", action="store_true", help="disable the background box behind text")
+    cap.add_argument("--model", default="mlx-community/whisper-large-v3-turbo")
+    cap.add_argument("--clean", action="store_true", help="drop disfluencies when auto-transcribing")
+
+    rf = sub.add_parser("reframe", help="reframe to a target aspect ratio (9:16, 1:1, 4:5) for social")
+    rf.add_argument("src")
+    rf.add_argument("-o", "--out", required=True)
+    rf.add_argument("--aspect", default="9:16", help="target aspect W:H (default 9:16)")
+    rf.add_argument("--mode", default="crop", choices=["crop", "pad"],
+                    help="crop=full-bleed (loses edges); pad=fit with blurred-fill background")
+    rf.add_argument("--focus", type=float, default=0.5,
+                    help="crop bias along the cut axis, 0..1 (0=left/top, 0.5=center, 1=right/bottom)")
+    rf.add_argument("--width", type=int, default=None, help="optional final output width in px")
+
     a = p.parse_args()
 
     if a.cmd == "info":
@@ -966,39 +1205,32 @@ def main():
         print(f"codec:      {codec}{suffix}")
 
     elif a.cmd == "transcribe":
-        import mlx_whisper
         print("transcribing…", flush=True)
         # Verbatim by default: whisper silently cleans hesitation sounds (um/uh) otherwise,
-        # which breaks filler-removal. Seed the decoder with only short disfluencies so it
-        # keeps them — a broader list (like/so/basically) over-biases toward real words.
+        # which breaks filler-removal. whisper_segments seeds the decoder to keep them;
         # --clean restores whisper's default behavior.
-        verbatim_kwargs = {} if a.clean else dict(
-            condition_on_previous_text=False,
-            initial_prompt="Um, uh, er, hmm...",
-        )
-        result = mlx_whisper.transcribe(
-            a.src,
-            path_or_hf_repo=a.model,
-            word_timestamps=True,
-            **verbatim_kwargs,
-        )
-        lines = []
-        if a.words:
-            for seg in result["segments"]:
-                for w in seg.get("words", []):
-                    lines.append(f"{w['start']:.3f}\t{w['end']:.3f}\t{w['word'].strip()}")
+        segments = whisper_segments(a.src, model=a.model, clean=a.clean)
+        if a.srt:
+            text = format_srt(segments)
+        elif a.vtt:
+            text = format_vtt(segments)
+        elif a.words:
+            lines = [f"{w['start']:.3f}\t{w['end']:.3f}\t{w['word'].strip()}"
+                     for seg in segments for w in seg.get("words", [])]
+            text = "\n".join(lines) + "\n"
         else:
-            for seg in result["segments"]:
+            lines = []
+            for seg in segments:
                 m0, s0 = divmod(seg["start"], 60)
                 m1, s1 = divmod(seg["end"], 60)
                 lines.append(f"[{int(m0):02d}:{s0:05.2f} --> {int(m1):02d}:{s1:05.2f}]  {seg['text'].strip()}")
-        text = "\n".join(lines)
+            text = "\n".join(lines) + "\n"
         if a.out:
             with open(a.out, "w") as f:
-                f.write(text + "\n")
-            print(f"saved {len(lines)} segments to {a.out}")
+                f.write(text)
+            print(f"saved {len(segments)} segments to {a.out}")
         else:
-            print(text)
+            print(text, end="")
 
     elif a.cmd == "speech-segments":
         spans = speech_segments(a.src, noise_db=a.noise, min_silence=a.min_silence)
@@ -1074,6 +1306,22 @@ def main():
 
     elif a.cmd == "splice":
         splice(a.clip_a, a.clip_b, a.out, crossfade=a.crossfade)
+        print(a.out)
+
+    elif a.cmd == "captions":
+        if a.srt:
+            segments = parse_subtitles(a.srt)
+            print(f"loaded {len(segments)} caption(s) from {a.srt}", flush=True)
+        else:
+            print("transcribing…", flush=True)
+            segments = whisper_segments(a.src, model=a.model, clean=a.clean)
+        burn_captions(a.src, a.out, segments, size=a.size, color=a.color,
+                      position=a.position, box=not a.no_box)
+        print(a.out)
+
+    elif a.cmd == "reframe":
+        reframe(a.src, a.out, aspect=a.aspect, mode=a.mode,
+                focus=a.focus, width=a.width)
         print(a.out)
 
 

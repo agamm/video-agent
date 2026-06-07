@@ -20,6 +20,10 @@ A technique that's just a one-line ffmpeg invocation lives in a skill, **not** a
   pixelize/circle/fade-to-black) via ffmpeg `xfade`.
 - **`audio-edit`** — normalizing loudness, denoising hiss/hum, or mixing background music
   (with ducking under speech).
+- **`captions`** — adding subtitles: burning captions into the picture or exporting an
+  `.srt`/`.vtt` file. Use `--clean` (opposite of filler-removal — viewers don't want um/uh).
+- **`reframe-social`** — reframing to 9:16 / 1:1 / 4:5 for Reels/Shorts/TikTok, including
+  keeping an off-center or moving subject in frame.
 
 This file keeps the always-needed command reference, ffmpeg cheatsheet, and universal
 pitfalls.
@@ -46,10 +50,26 @@ uv run video-agent info video.mp4
 # transcribe — speech to text (mlx-whisper, Apple Silicon; model ~1.5GB on first run)
 uv run video-agent transcribe video.mp4 [-o out.txt]      # [MM:SS.ss --> MM:SS.ss] text
 uv run video-agent transcribe video.mp4 --words -o w.txt  # start_sec  end_sec  word
+uv run video-agent transcribe video.mp4 --clean --srt -o subs.srt   # SubRip subtitle file
+uv run video-agent transcribe video.mp4 --clean --vtt -o subs.vtt   # WebVTT subtitle file
 #   USE FOR: *what* was said — find a filler by name, read content, subtitles. Word times
 #   jitter ±0.3-0.7s (and shift between runs) → NEVER cut on them; pair with speech-segments
 #   (WHERE) to place the actual cut. Verbatim by default — keeps um/uh hesitations (seeds the
 #   decoder with a short filler prompt); --clean drops disfluencies. See filler-removal skill.
+#   --srt/--vtt export sidecar subtitle files (use --clean for these). See captions skill.
+
+# captions — burn subtitles into the video (PIL render; mise ffmpeg lacks drawtext)
+uv run video-agent captions video.mp4 -o out.mp4 --clean          # auto-transcribe + burn
+uv run video-agent captions video.mp4 --srt subs.srt -o out.mp4   # burn an edited .srt/.vtt
+#   --size --color --position bottom|top|center --no-box. Reframe BEFORE captioning.
+#   For accuracy: transcribe --srt → hand-edit → captions --srt. See captions skill.
+
+# reframe — change aspect ratio for social (9:16 reels, 1:1, 4:5) from horizontal source
+uv run video-agent reframe video.mp4 -o reel.mp4 --aspect 9:16              # crop (full-bleed)
+uv run video-agent reframe video.mp4 -o reel.mp4 --aspect 9:16 --mode pad --width 1080
+#   crop (default) = full-bleed, loses edges; --focus 0..1 biases the crop to keep an
+#   off-center subject (no face tracking — read position-grid). pad = blurred-fill, keeps
+#   whole frame. See reframe-social skill (incl. following a moving subject).
 
 # speech-segments — speech/silence spans via silencedetect (inverts silence → speech)
 uv run video-agent speech-segments video.mp4   # kind  start  end  dur  (tab-separated)
