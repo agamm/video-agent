@@ -1,6 +1,9 @@
-"""MP4 video toolkit — frame detection, Grok editing, transcription, and YouTube download.
+"""MP4 video toolkit — local, frame-accurate video editing.
 
-For all other editing use ffmpeg directly. See CLAUDE.md.
+Editing core (no API key, no cloud): transcription, cutting, frame search, overlays,
+transitions, audio. Optional generative VFX (recolor / smoke / restyle) via pluggable
+cloud backends lives behind the `vfx` extra — see `vfx_edit`. For everything else use
+ffmpeg directly. See CLAUDE.md.
 
 CLI:
     uv run video-agent info <src>
@@ -10,11 +13,11 @@ CLI:
     uv run video-agent trim <src> --start S --end E -o out.mp4
     uv run video-agent frame <src> --at T -o frame.png
     uv run video-agent concat a.mp4 b.mp4 ... -o out.mp4
-    uv run video-agent grok-edit <src> --prompt "Make sunglasses red" -o out.mp4
+    uv run video-agent vfx-edit <src> --prompt "Make sunglasses red" -o out.mp4   # optional; needs [vfx] extra + API key
 
 Position values: bare integer = frame number; float or HH:MM:SS = seconds.
 
-AV1 note: ffmpeg cannot decode AV1 on this machine. trim/frame/detect/grok-edit
+AV1 note: ffmpeg cannot decode AV1 on this machine. trim/frame/detect/vfx-edit
 automatically route AV1 sources through PyAV (libdav1d) for decoding.
 """
 from __future__ import annotations
@@ -41,7 +44,13 @@ def xai_client():
         raise RuntimeError(
             "XAI_API_KEY is not set. Add it to .env:\n  XAI_API_KEY=xai-..."
         )
-    from xai_sdk import Client
+    try:
+        from xai_sdk import Client
+    except ImportError:
+        raise RuntimeError(
+            "Generative VFX needs the optional 'vfx' extra:\n"
+            "  uv sync --extra vfx   (or: pip install 'video-agent[vfx]')"
+        )
     return Client(api_key=key)
 
 
@@ -682,6 +691,20 @@ def _start_tunnel(serve_dir: str):
     raise RuntimeError("cloudflared failed to start — is it installed? (mise install cloudflared)")
 
 
+def vfx_edit(src: str, prompt: str, out: str, backend: str = "grok", **kwargs) -> str:
+    """Provider-agnostic generative VFX edit (reimagines footage: recolor, smoke, restyle…).
+
+    `backend` selects the cloud model provider. Requires the optional `vfx` extra
+    (`uv sync --extra vfx`) plus that provider's API key — the editing core never needs it.
+    Extra kwargs (splice_into / splice_start / splice_end / reference_images) pass through
+    to the backend. Add new providers (runway/veo/…) to the `_VFX_BACKENDS` registry.
+    """
+    if backend not in _VFX_BACKENDS:
+        raise ValueError(
+            f"unknown vfx backend {backend!r}; available: {', '.join(_VFX_BACKENDS)}")
+    return _VFX_BACKENDS[backend](src, prompt, out, **kwargs)
+
+
 def grok_edit(src: str, prompt: str, out: str,
               splice_into: str = None, splice_start=None, splice_end=None,
               reference_images: list = None) -> str:
@@ -792,6 +815,10 @@ def grok_edit(src: str, prompt: str, out: str,
     return out
 
 
+# Generative VFX backend registry: name -> impl. Add "runway"/"veo"/… here as they land.
+_VFX_BACKENDS = {"grok": grok_edit}
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -841,8 +868,11 @@ def main():
     ss.add_argument("--min-silence", type=float, default=0.15,
                     help="minimum silence duration in seconds (default 0.15)")
 
-    ge = sub.add_parser("grok-edit", help="edit video with Grok AI; use --splice-into to embed result back in source")
+    ge = sub.add_parser("vfx-edit", aliases=["grok-edit"],
+                        help="OPTIONAL generative AI edit (needs `vfx` extra + API key); --splice-into embeds result back in source")
     ge.add_argument("src")
+    ge.add_argument("--backend", default="grok", choices=sorted(_VFX_BACKENDS),
+                    help="generative VFX provider (default: grok)")
     ge.add_argument("--prompt", required=True, help="edit instruction, e.g. 'make sunglasses red'")
     ge.add_argument("-o", "--out", required=True)
     ge.add_argument("--splice-into", default=None, metavar="SOURCE",
@@ -996,12 +1026,12 @@ def main():
             suffix = "..." if len(frames) > 4 else ""
             print(f"  {fname}: {times}{suffix}")
 
-    elif a.cmd == "grok-edit":
-        print(grok_edit(a.src, a.prompt, a.out,
-                        splice_into=a.splice_into,
-                        splice_start=a.splice_start,
-                        splice_end=a.splice_end,
-                        reference_images=a.reference))
+    elif a.cmd in ("vfx-edit", "grok-edit"):
+        print(vfx_edit(a.src, a.prompt, a.out, backend=a.backend,
+                       splice_into=a.splice_into,
+                       splice_start=a.splice_start,
+                       splice_end=a.splice_end,
+                       reference_images=a.reference))
 
     elif a.cmd == "trim":
         trim(a.src, a.start, a.end, a.out)

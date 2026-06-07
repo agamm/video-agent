@@ -10,7 +10,10 @@ A technique that's just a one-line ffmpeg invocation lives in a skill, **not** a
 — commands are reserved for operations needing real code. Invoke the matching skill when:
 
 - **`filler-removal`** — removing um/uh/filler words from speech.
-- **`grok-video-edit`** — AI edits that reimagine footage (recolor, add smoke/fire/glow, restyle).
+- **`grok-video-edit`** — generative AI edits that reimagine footage (recolor, add smoke/fire/
+  glow, restyle). OPTIONAL: needs the `vfx` extra (`uv sync --extra vfx`) + an API key; the
+  rest of the toolkit is local and key-free. Results vary run-to-run — prefer deterministic
+  commands/skills when they can do the job.
 - **`video-overlay`** — compositing text/image/animated graphics onto video, and placing
   them accurately (including locking to a face/eye/moving subject).
 - **`video-transitions`** — joining two clips with a visible transition (wipe/slide/dissolve/
@@ -23,9 +26,9 @@ pitfalls.
 
 ## Setup
 ```bash
-uv sync
+uv sync                       # editing core — local, no API key
 # ffmpeg required: mise install ffmpeg
-# XAI_API_KEY in .env
+# OPTIONAL generative VFX (vfx-edit): uv sync --extra vfx  +  XAI_API_KEY in .env
 ```
 
 ---
@@ -96,8 +99,9 @@ uv run video-agent position-grid video.mp4 --at 14.2 --spacing 200 -o grid.png
 #   Start at spacing 200 (100 is too dense to read). See video-overlay skill for the
 #   crop-zoom + compute-don't-eyeball positioning workflow.
 
-# grok-edit — AI edit (see grok-video-edit skill; always trim target region first)
-uv run video-agent grok-edit clip.mp4 --prompt "Make the lenses solid red" -o out.mp4
+# vfx-edit — OPTIONAL generative AI edit (needs `vfx` extra + API key; see grok-video-edit
+#   skill; always trim the target region first). --backend grok (default); grok-edit = alias.
+uv run video-agent vfx-edit clip.mp4 --prompt "Make the lenses solid red" -o out.mp4
 
 # splice — join two clips with audio+video crossfade (no hard cut)
 uv run video-agent splice a.mp4 b.mp4 -o out.mp4

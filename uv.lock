@@ -2184,9 +2184,13 @@ dependencies = [
     { name = "mlx-whisper" },
     { name = "pillow" },
     { name = "python-dotenv" },
+    { name = "yt-dlp" },
+]
+
+[package.optional-dependencies]
+vfx = [
     { name = "requests" },
     { name = "xai-sdk" },
-    { name = "yt-dlp" },
 ]
 
 [package.dev-dependencies]
@@ -2200,10 +2204,11 @@ requires-dist = [
     { name = "mlx-whisper", specifier = ">=0.4.3" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
-    { name = "requests", specifier = ">=2.34.2" },
-    { name = "xai-sdk", specifier = ">=1.15.0" },
+    { name = "requests", marker = "extra == 'vfx'", specifier = ">=2.34.2" },
+    { name = "xai-sdk", marker = "extra == 'vfx'", specifier = ">=1.15.0" },
     { name = "yt-dlp", specifier = ">=2026.3.17" },
 ]
+provides-extras = ["vfx"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0.3" }]

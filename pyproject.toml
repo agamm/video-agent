@@ -7,9 +7,15 @@ dependencies = [
     "mlx-whisper>=0.4.3",
     "pillow>=12.2.0",
     "python-dotenv>=1.2.2",
-    "requests>=2.34.2",
-    "xai-sdk>=1.15.0",
     "yt-dlp>=2026.3.17",
+]
+
+[project.optional-dependencies]
+# Generative VFX backends (cloud, paid, optional). The editing core needs none of these.
+# Install with: uv sync --extra vfx   (or: pip install 'video-agent[vfx]')
+vfx = [
+    "xai-sdk>=1.15.0",
+    "requests>=2.34.2",
 ]
 
 [project.scripts]
