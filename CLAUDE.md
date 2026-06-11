@@ -9,6 +9,11 @@ Workflows and ffmpeg techniques with non-obvious gotchas are documented as skill
 A technique that's just a one-line ffmpeg invocation lives in a skill, **not** a CLI command
 — commands are reserved for operations needing real code. Invoke the matching skill when:
 
+- **`editor`** — the director: hand it raw footage and a target genre/format (montage,
+  documentary, tutorial, news, workshop, vlog, trailer, explainer). It understands the video
+  (transcribe + frame/grid sampling — no separate AI key; Claude reads the frames), picks a
+  treatment, and composes the skills below into an ordered edit plan. Start here when the ask
+  is "edit this into a X" rather than one specific operation.
 - **`filler-removal`** — removing um/uh/filler words from speech.
 - **`grok-video-edit`** — generative AI edits that reimagine footage (recolor, add smoke/fire/
   glow, restyle). OPTIONAL: needs the `vfx` extra (`uv sync --extra vfx`) + an API key; the
