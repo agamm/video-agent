@@ -7,6 +7,7 @@ __pycache__/
 
 # media — never commit
 inputs/
+outputs/
 grids/
 *.mp4
 *.aac
