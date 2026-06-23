@@ -26,6 +26,26 @@ most clips. For **precise** targets (or batch consistency), do two-pass: run onc
 `loudnorm=...:print_format=json`, read the measured values, then pass them back as
 `measured_I`/`measured_TP`/`measured_LRA`/`measured_thresh` on a second run.
 
+## Even out inconsistent levels (loud speaker vs quiet audience)
+
+The most common "fix the audio" complaint on talks/panels/interviews isn't noise — it's
+**level swings**: the presenter is loud and near the mic, audience questions are faint, peaks
+nearly clip. Compress to tighten the dynamic range, then normalize:
+
+```bash
+ffmpeg -y -i in.mp4 -af \
+  "acompressor=threshold=-21dB:ratio=3:attack=15:release=250:makeup=3,\
+   equalizer=f=2800:t=q:w=2:g=2,\
+   loudnorm=I=-14:TP=-1.5:LRA=9" \
+  -c:v copy -c:a aac out.mp4
+```
+- `acompressor` pulls the loud parts down; `makeup` lifts everything so the quiet parts come
+  up — net result is consistent loudness. Lower `threshold` / higher `ratio` = more leveling.
+- The gentle `equalizer` presence bump (~2.5–3.5 kHz) adds intelligibility.
+- `loudnorm` with a **tight `LRA` (7–9)** finishes the leveling; check the output isn't pumping.
+- Diagnose first with `astats` (`RMS level dB` / `Peak level dB`) — a wide RMS-to-peak gap or a
+  peak near 0 dB confirms it needs compression, not denoise.
+
 ## Denoise (hiss / hum)
 
 ```bash

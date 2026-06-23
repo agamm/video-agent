@@ -1035,6 +1035,180 @@ _VFX_BACKENDS = {"grok": grok_edit}
 
 
 # ---------------------------------------------------------------------------
+# EDL — the edit is a JSON file (auditable, re-runnable cut list)
+# ---------------------------------------------------------------------------
+
+# Normalize every segment to a common geometry so concat never desyncs / errors.
+def _edl_vchain(W, H, fps):
+    return (f"setpts=PTS-STARTPTS,fps={fps},"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p")
+
+
+def edl_render(edl_path: str, out: str):
+    """Execute an edit.json (Edit Decision List) → one re-encoded video.
+
+    Schema (see the edl-edit skill):
+      {
+        "fps": 60, "width": 1920, "height": 1080,   # all optional (defaults shown)
+        "grade": "luts/warm.cube",                   # optional LUT applied to the whole cut
+        "audio_fix": "loudnorm=I=-14:TP=-1.5:LRA=11",# optional final audio filter chain
+        "clips": [
+          {"src": "a.mp4", "start": 1.89, "end": 60.81,
+           "first_words": "Hey everyone", "rationale": "cleanest take, zero ums"},
+          # multicam cutaway — audio from src, picture from a second camera:
+          {"src": "a.mp4", "start": 70.0, "end": 78.0,
+           "vsrc": "roomcam.mp4", "vstart": 141.3, "vend": 149.3,
+           "rationale": "cut to wide while the slide is static"}
+        ]
+      }
+    `start`/`end` (and `vstart`/`vend`) are seconds (floats) on the SOURCE timeline; cuts are
+    frame-accurate (trim filter, not -ss seeking). `rationale`/`first_words` are documentation
+    only — ignored by the renderer, read by humans. Every boundary is exact source-time so the
+    continuous audio stays gapless. After rendering, VERIFY by re-transcribing `out`.
+    """
+    edl = json.load(open(edl_path))
+    clips = edl["clips"]
+    if not clips:
+        raise ValueError("EDL has no clips")
+    fps = edl.get("fps", 60)
+    W, H = edl.get("width", 1920), edl.get("height", 1080)
+    vchain = _edl_vchain(W, H, fps)
+
+    inputs: list[str] = []
+    def _idx(path):
+        ap = os.path.abspath(path)
+        if ap not in inputs:
+            inputs.append(ap)
+        return inputs.index(ap)
+
+    def _has_audio(path):
+        out = _run(["ffprobe", "-v", "error", "-select_streams", "a",
+                    "-show_entries", "stream=index", "-of", "csv=p=0", path])
+        return bool(out.strip())
+
+    audio_cache: dict[str, bool] = {}
+    need_silence = False
+    parts, labels = [], []
+    for i, c in enumerate(clips):
+        a_src, a_s, a_e = c["src"], float(c["start"]), float(c["end"])
+        v_src = c.get("vsrc", a_src)
+        v_s = float(c.get("vstart", a_s))
+        v_e = float(c.get("vend", a_e))
+        vi, ai = _idx(v_src), _idx(a_src)
+        parts.append(f"[{vi}:v]trim={v_s:.3f}:{v_e:.3f},{vchain}[v{i}]")
+        ap = os.path.abspath(a_src)
+        if ap not in audio_cache:
+            audio_cache[ap] = _has_audio(a_src)
+        if audio_cache[ap]:
+            parts.append(f"[{ai}:a]atrim={a_s:.3f}:{a_e:.3f},asetpts=PTS-STARTPTS,"
+                         f"aformat=channel_layouts=stereo:sample_rates=48000[a{i}]")
+        else:  # silent source (e.g. a title card) → synthesize silence of the clip's length
+            need_silence = True
+            parts.append(f"[__SIL__:a]atrim=0:{a_e - a_s:.3f},asetpts=PTS-STARTPTS,"
+                         f"aformat=channel_layouts=stereo:sample_rates=48000[a{i}]")
+        labels.append(f"[v{i}][a{i}]")
+
+    graph = ";".join(parts) + ";" + "".join(labels)
+    graph += f"concat=n={len(clips)}:v=1:a=1[vc0][ac0]"
+    vmap, amap = "[vc0]", "[ac0]"
+    if edl.get("grade"):
+        graph += f";[vc0]lut3d={edl['grade']}[vc]"; vmap = "[vc]"
+    if edl.get("audio_fix"):
+        graph += f";[ac0]{edl['audio_fix']}[ac]"; amap = "[ac]"
+    if need_silence:
+        graph = graph.replace("__SIL__", str(len(inputs)))  # anullsrc is the input after the files
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write(graph + "\n")
+        gfile = f.name
+    try:
+        cmd = ["ffmpeg", "-y"]
+        for p in inputs:
+            cmd += ["-i", p]
+        if need_silence:
+            cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        cmd += ["-/filter_complex", gfile, "-map", vmap, "-map", amap,
+                "-c:v", VCODEC, "-b:v", "9M", "-c:a", "aac", "-b:a", "192k",
+                "-ar", "48000", "-movflags", "+faststart", out]
+        _run(cmd)
+    finally:
+        os.unlink(gfile)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Color grading — .cube / HALD LUTs via ffmpeg
+# ---------------------------------------------------------------------------
+
+def grade_apply(src: str, lut: str, out: str):
+    """Apply a color grade LUT. `.cube` → lut3d; `.png` HALD-CLUT → haldclut."""
+    if lut.lower().endswith(".png"):
+        vf = f"[0:v][1:v]haldclut"
+        _run(["ffmpeg", "-y", "-i", src, "-i", lut, "-filter_complex", vf,
+              "-c:v", VCODEC, "-b:v", "9M", "-c:a", "copy", out])
+    else:
+        _run(["ffmpeg", "-y", "-i", src, "-vf", f"lut3d={lut}",
+              "-c:v", VCODEC, "-b:v", "9M", "-c:a", "copy", out])
+    return out
+
+
+def grade_preview(src: str, at, luts: list, out: str):
+    """Contact sheet: one frame graded by each candidate LUT, side by side, labelled.
+
+    `luts` may include the literal "none" for the ungraded original. Labels are drawn with
+    PIL (this ffmpeg is LGPL — no drawtext), like the captions command.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    info = video_info(src)
+    t = to_seconds(at, info["fps"])
+    cw = 640
+    cells = []
+    with tempfile.TemporaryDirectory() as td:
+        for n, lut in enumerate(luts):
+            tile = os.path.join(td, f"t{n}.png")
+            if lut == "none":
+                _run(["ffmpeg", "-y", "-ss", str(t), "-i", src, "-frames:v", "1",
+                      "-vf", f"scale={cw}:-2", tile]); label = "original"
+            elif lut.lower().endswith(".png"):
+                _run(["ffmpeg", "-y", "-ss", str(t), "-i", src, "-i", lut, "-frames:v", "1",
+                      "-filter_complex", f"[0:v][1:v]haldclut,scale={cw}:-2", tile])
+                label = os.path.basename(lut)
+            else:
+                _run(["ffmpeg", "-y", "-ss", str(t), "-i", src, "-frames:v", "1",
+                      "-vf", f"lut3d={lut},scale={cw}:-2", tile]); label = os.path.basename(lut)
+            cells.append((Image.open(tile).convert("RGB").copy(), label))
+        ch = cells[0][0].height
+        cols = min(3, len(cells)); rows = (len(cells) + cols - 1) // cols
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 26)
+        except Exception:
+            font = ImageFont.load_default()
+        sheet = Image.new("RGB", (cols * cw, rows * (ch + 30)), (15, 15, 15))
+        dr = ImageDraw.Draw(sheet)
+        for n, (img, label) in enumerate(cells):
+            x, y = (n % cols) * cw, (n // cols) * (ch + 30)
+            sheet.paste(img, (x, y + 30))
+            dr.rectangle([x, y, x + cw, y + 30], fill=(0, 0, 0))
+            dr.text((x + 6, y + 3), label, fill=(255, 255, 0), font=font)
+        sheet.save(out)
+    return out
+
+
+def grade_gen_lut(eq: str, out: str, level: int = 8):
+    """Bake an ffmpeg color-filter chain into a reusable LUT by running an identity
+    HALD-CLUT through it. Output `.png` (use via haldclut) — fast, exact, no deps.
+
+    `eq` is any ffmpeg video-filter chain, e.g. "eq=contrast=1.1:saturation=1.2,curves=..."
+    """
+    if not out.lower().endswith(".png"):
+        out = out.rsplit(".", 1)[0] + ".png"
+    _run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"haldclutsrc=level={level}",
+          "-vf", eq, "-frames:v", "1", out])
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1192,6 +1366,19 @@ def main():
                     help="crop bias along the cut axis, 0..1 (0=left/top, 0.5=center, 1=right/bottom)")
     rf.add_argument("--width", type=int, default=None, help="optional final output width in px")
 
+    el = sub.add_parser("edl", help="execute an edit.json (clip list + rationale) → one video")
+    el.add_argument("edit", help="path to edit.json (see edl-edit skill for schema)")
+    el.add_argument("-o", "--out", required=True)
+
+    gr = sub.add_parser("grade", help="color-grade via .cube/HALD LUTs (apply | preview | gen-lut)")
+    gr.add_argument("action", choices=["apply", "preview", "gen-lut"])
+    gr.add_argument("src", nargs="?", help="input video (apply/preview)")
+    gr.add_argument("--lut", action="append", default=[],
+                    help=".cube or HALD .png LUT (repeatable for preview; 'none'=original)")
+    gr.add_argument("--at", default="0.0", help="preview frame position (float secs / HH:MM:SS)")
+    gr.add_argument("--eq", help="ffmpeg filter chain to bake into a LUT (gen-lut)")
+    gr.add_argument("-o", "--out", required=True)
+
     a = p.parse_args()
 
     if a.cmd == "info":
@@ -1322,6 +1509,23 @@ def main():
     elif a.cmd == "reframe":
         reframe(a.src, a.out, aspect=a.aspect, mode=a.mode,
                 focus=a.focus, width=a.width)
+        print(a.out)
+
+    elif a.cmd == "edl":
+        edl_render(a.edit, a.out)
+        print(a.out)
+
+    elif a.cmd == "grade":
+        if a.action == "apply":
+            if not a.lut:
+                p.error("grade apply needs --lut <file>")
+            grade_apply(a.src, a.lut[0], a.out)
+        elif a.action == "preview":
+            grade_preview(a.src, a.at, a.lut or ["none"], a.out)
+        elif a.action == "gen-lut":
+            if not a.eq:
+                p.error("grade gen-lut needs --eq <filter chain>")
+            a.out = grade_gen_lut(a.eq, a.out)
         print(a.out)
 
 

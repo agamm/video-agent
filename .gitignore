@@ -22,3 +22,7 @@ grids/
 # claude code — keep skills tracked, ignore local state
 .claude/*
 !.claude/skills/
+
+# remotion (optional graphics) build artifacts
+remotion/node_modules/
+remotion/out/

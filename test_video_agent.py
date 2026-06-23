@@ -89,6 +89,43 @@ def test_reframe_pad_square(test_mp4, tmp_path):
     assert info["width"] == info["height"]
 
 
+def test_edl_render_concats_clips(test_mp4, tmp_path):
+    edit = {"fps": 30, "width": 320, "height": 240, "clips": [
+        {"src": test_mp4, "start": 0.0, "end": 2.0, "rationale": "head"},
+        {"src": test_mp4, "start": 3.0, "end": 5.0, "rationale": "tail"},
+    ]}
+    ep = tmp_path / "edit.json"
+    ep.write_text(json.dumps(edit))
+    out = str(tmp_path / "edl.mp4")
+    va.edl_render(str(ep), out)
+    assert os.path.exists(out)
+    assert abs(va.video_info(out)["duration"] - 4.0) < 0.3  # 2.0 + 2.0
+
+
+def test_edl_render_multicam_vsrc(test_mp4, tmp_path):
+    # vsrc takes picture from a second source while audio stays on src — must not error.
+    edit = {"fps": 30, "width": 320, "height": 240, "clips": [
+        {"src": test_mp4, "start": 0.0, "end": 2.0,
+         "vsrc": test_mp4, "vstart": 2.0, "vend": 4.0, "rationale": "cutaway"},
+    ]}
+    ep = tmp_path / "e2.json"
+    ep.write_text(json.dumps(edit))
+    out = str(tmp_path / "edl2.mp4")
+    va.edl_render(str(ep), out)
+    assert os.path.exists(out)
+    assert abs(va.video_info(out)["duration"] - 2.0) < 0.3
+
+
+def test_grade_gen_and_apply(test_mp4, tmp_path):
+    lut = str(tmp_path / "look.png")
+    va.grade_gen_lut("curves=all='0/0 0.5/0.6 1/1'", lut)
+    assert os.path.exists(lut)
+    out = str(tmp_path / "graded.mp4")
+    va.grade_apply(test_mp4, lut, out)
+    assert os.path.exists(out)
+    assert abs(va.video_info(out)["duration"] - va.video_info(test_mp4)["duration"]) < 0.3
+
+
 def test_xai_client_missing_key(monkeypatch):
     monkeypatch.delenv("XAI_API_KEY", raising=False)
     # patch load_dotenv so it doesn't re-read the .env file

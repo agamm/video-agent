@@ -85,7 +85,8 @@ if you need to tune the threshold: `ffmpeg -i in.mp4 -af silencedetect=noise=-30
    - Missing word start → decrease lead-in by 0.05s
    - Sounds natural → approve
 5. After concat, **re-transcribe the output** (verbatim again) and confirm no non-filler
-   speech was removed.
+   speech was removed — and **grep the re-transcript for `um`/`uh`** to confirm the fillers are
+   actually gone (the strongest, content-level check that the cuts landed right).
 6. If real speech is missing → restore that cut from the original and iterate.
 7. Done when: every preview sounds natural AND the re-transcription matches intent.
 

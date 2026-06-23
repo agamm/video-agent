@@ -29,6 +29,16 @@ A technique that's just a one-line ffmpeg invocation lives in a skill, **not** a
   `.srt`/`.vtt` file. Use `--clean` (opposite of filler-removal — viewers don't want um/uh).
 - **`reframe-social`** — reframing to 9:16 / 1:1 / 4:5 for Reels/Shorts/TikTok, including
   keeping an off-center or moving subject in frame.
+- **`edl-edit`** — assemble a multi-clip edit as an auditable `edit.json` (clips + in/out +
+  written rationale, incl. multicam `vsrc` cutaways) that the `edl` command renders in one
+  pass. Reach for this for any multi-cut stitch instead of a throwaway filtergraph.
+- **`color-grade`** — apply a look / `.cube`/HALD LUT, or render candidate looks to pick from
+  (`grade` command). NOTE: this is an LGPL ffmpeg — **no `eq`/`drawtext` filters**; grade with
+  curves/colorbalance/colorchannelmixer/lut3d/haldclut.
+- **`remotion-graphics`** — OPTIONAL animated motion graphics (kinetic captions, animated
+  lower-thirds, branded cards) as React/Remotion → transparent layer → ffmpeg composite. Heavy
+  (Node + Chromium download, company-license caveat); use only for real motion design, else
+  `video-overlay`. Scaffold in `remotion/`.
 
 This file keeps the always-needed command reference, ffmpeg cheatsheet, and universal
 pitfalls.
@@ -130,6 +140,18 @@ uv run video-agent vfx-edit clip.mp4 --prompt "Make the lenses solid red" -o out
 
 # splice — join two clips with audio+video crossfade (no hard cut)
 uv run video-agent splice a.mp4 b.mp4 -o out.mp4
+
+# edl — execute an edit.json (clip list + rationale) → one video. See edl-edit skill.
+uv run video-agent edl edit.json -o out.mp4
+#   clips: [{src,start,end,rationale, (opt) vsrc/vstart/vend for a multicam cutaway}],
+#   plus optional fps/width/height/grade(LUT)/audio_fix. Frame-accurate, one re-encode.
+#   VERIFY by re-transcribing the output: transcribe out.mp4 --clean.
+
+# grade — color grade via .cube/HALD LUTs (see color-grade skill)
+uv run video-agent grade apply in.mp4 --lut luts/warm.png -o out.mp4
+uv run video-agent grade preview in.mp4 --at 45.0 --lut none --lut a.cube --lut b.png -o looks.png
+uv run video-agent grade gen-lut --eq "curves=...,colorbalance=..." -o luts/warm.png
+#   gen-lut bakes a color-filter chain into a HALD LUT. LGPL ffmpeg: NO eq/drawtext.
 ```
 
 ---
@@ -208,8 +230,9 @@ ffmpeg -i in.mp4 -vf "scale=1280:720" -c:v h264_videotoolbox out.mp4
 ffmpeg -i in.mp4 -an -c:v copy out.mp4
 ffmpeg -i in.mp4 -i audio.mp3 -map 0:v -map 1:a -c:v copy -shortest out.mp4
 
-# Color grade
-ffmpeg -i in.mp4 -vf "eq=brightness=0.05:contrast=1.1:saturation=1.2" -c:v h264_videotoolbox out.mp4
+# Color grade — NOTE: this is an LGPL ffmpeg, so the GPL `eq` filter is NOT available.
+# Use curves / colorbalance / colorchannelmixer, or a LUT (see color-grade skill + `grade` cmd).
+ffmpeg -i in.mp4 -vf "curves=all='0/0 0.5/0.55 1/1',colorbalance=rs=0.04:bs=-0.04" -c:v h264_videotoolbox out.mp4
 ```
 
 ---

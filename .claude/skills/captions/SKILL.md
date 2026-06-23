@@ -65,9 +65,12 @@ uv run video-agent captions video.mp4 -o out.mp4 --srt subs.srt \
   line gets large; split the video, caption each part, then concat.
 - **Timing comes from whisper segment boundaries**, which read fine but can be ~0.3s loose.
   For tight sync, edit the times in the `.srt` and re-burn with `--srt`.
-- **Word-level "karaoke" captions** (one or two words popping per beat) aren't built in.
+- **Word-level "karaoke" captions** (one or two words popping per beat) aren't built in here.
   Approximate by transcribing `--words`, grouping into short segments, and writing your own
-  `.srt` with tight start/end per group, then `captions --srt`.
+  `.srt` with tight start/end per group, then `captions --srt`. For *animated* per-word pops
+  (eased, scaled), use the optional `remotion-graphics` skill's `KineticCaption` — fed the same
+  `--words` timestamps. Either way the timing is **grepped from the `--words` transcript, never
+  scrubbed.**
 - **Burn on the final-resolution video.** If you're also reframing for social
   (`reframe` skill), reframe **first**, then caption — so font size and wrapping match the
   output frame, not the original.

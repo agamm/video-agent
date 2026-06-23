@@ -50,6 +50,11 @@ Use the **split-overlay-concat** pattern: split source into before/during/after,
 overlay only to the middle segment (no enable clause), then filter_complex concat the three.
 `overlay-gif` does this internally when `--start`/`--end` are given.
 
+**Get the WHEN from the transcript, not by scrubbing.** To land a label/callout on a spoken
+word or phrase, `transcribe --words` and grep for it → read its start/end → that's your
+`--start`/`--end` (or `enable` window). Spatial placement uses the grid/dot-probe below;
+temporal placement uses the word timestamps. (Same "the edit is text" discipline as `edl-edit`.)
+
 ## Positioning accurately — DON'T iterate-and-eyeball
 
 Guessing coordinates and re-rendering to check is slow and error-prone. Pick by subject:

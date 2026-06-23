@@ -1,6 +1,6 @@
 ---
 name: editor
-description: Turn raw footage into a finished edit in a specific genre/format — montage, documentary, tutorial, news, workshop, vlog, trailer, explainer. Use whenever the user wants the video "edited into a X", asks "what style should this be / what would make a good X", or hands over raw footage without spelling out every cut. This is the director: it understands the footage first, picks a treatment, then composes the other skills (filler-removal, captions, reframe-social, video-transitions, video-overlay, audio-edit, grok-video-edit) to execute it.
+description: Turn raw footage into a finished edit in a specific genre/format — montage, documentary, tutorial, news, workshop, vlog, trailer, explainer. Use whenever the user wants the video "edited into a X", asks "what style should this be / what would make a good X", or hands over raw footage without spelling out every cut. This is the director: it understands the footage first, picks a treatment, then composes the other skills (edl-edit, filler-removal, captions, reframe-social, video-transitions, video-overlay, audio-edit, color-grade, remotion-graphics, grok-video-edit) to execute it.
 ---
 
 # Editor — understand the footage, then edit it to a style
@@ -107,14 +107,62 @@ freezes at non-keyframe seams; re-encode audio to kill drift).
 The point of this skill is the *method* (read → map → compose), so new genres are easy:
 - **Vlog** — personable: jump-cuts, light music, `captions`, occasional `overlay-text` asides.
 - **Trailer** — dramatic: music-driven, escalating fast cuts, big `overlay-text`, `xfade`
-  fade-to-black, hard ending. Hook in the first 2s.
+  transitions (`fade`/`pixelize`) between beats, fade-from-black in / fade-to-black out. Hook in
+  the first 2s. For the bed: profile a music track's energy (RMS per second) and take a segment
+  whose **build peaks at your climax beat** (the payoff/button); lay it under via the
+  `audio-edit` duck recipe so soundbites stay clear. Keep the key spoken lines, not full
+  sentences.
 - **Explainer-short** — `reframe 9:16`, hook line as `overlay-text` in first 2s, `captions`
   (clean, karaoke-style if time allows), ruthless tightening to <60s.
 
+## Multi-camera / multi-source footage (cutaways)
+
+When you're handed two+ recordings of the *same* event (e.g. a room/wide camera + a
+screen-capture, two phones, broadcast + slides), cut between them for energy — but they're
+rarely frame-aligned, especially if one was trimmed (de-sensitized, ad breaks, etc.).
+
+- **Sync by audio cross-correlation, not by eye.** Decode each to mono ~8 kHz, take a smoothed
+  amplitude envelope (`abs` then a ~20 ms moving average), and `scipy.signal.correlate` a short
+  window of source A against a wider search window of source B → the lag is the offset. The
+  correlation peak doubles as a confidence score.
+- **The offset can be piecewise-constant.** If one source had sections removed, the offset
+  **jumps at each removal**, so measure it **locally per cutaway window**, not once globally. A
+  window that straddles a removed cut gets a low correlation score — use that to **auto-drop**
+  bad windows.
+- **Keep ONE audio track continuous; switch only the video.** Take audio from the primary
+  source for the whole timeline and replace just the *picture* during a cutaway (room cam video
+  + primary audio). No audio seam, sync is automatic, and any sensitive audio that was removed
+  from the primary never re-airs.
+- **Never cut to a frame with no subject in it.** A fixed wide cam often has the speaker dark at
+  the very edge — which fools brightness/diff detectors — so *verify presence* (background-
+  subtract the side zones, or just look at a frame per window) and drop the genuinely empty
+  ("everyone walked off") windows.
+- **Assemble in one pass.** Generate a single `filter_complex` that `trim`s each segment
+  (screen spans from the primary, room spans from the other input at `t+offset`) and `concat`s
+  them — re-encodes once, and every boundary lands on exact source-time so audio stays gapless.
+  A center-out montage tool (`detect`) or per-window frame grabs make the presence check cheap.
+
+## Pacing cleanup (remove dead air)
+
+"Lightly cleaned" usually means collapsing long pauses, not cutting content. Run
+`silencedetect` (`-af silencedetect=noise=-30dB:d=1.0`), build a keep-list that shortens each
+gap over the threshold to ~0.4–0.7 s, and `concat` the keep-segments. Conservative thresholds
+(≥1 s) avoid clipping breaths; verify a couple of cuts don't truncate a burned-in caption.
+This is distinct from `filler-removal` (which cuts spoken um/uh) — silence collapse leaves the
+words, just tightens the gaps.
+
 ## Step 4 — Assemble and deliver ONE finished video
 
-- Final join: `filter_complex concat` with `-c:a aac -ar 44100` (re-encode) after any
-  filtered/Grok/overlay segment.
+- **Author the cut as an `edit.json` (EDL), not a throwaway filtergraph** — for any multi-clip
+  stitch, list the clips with in/out + a written rationale and render with `edl-edit` (`uv run
+  video-agent edl edit.json -o out.mp4`). It's auditable, diffable, re-runnable, and handles
+  multicam cutaways (`vsrc`) and a final `grade`/`audio_fix`. **Verify by re-transcribing the
+  output.** Reach for a hand-built `filter_complex` only for one-offs the EDL can't express.
+- Optional polish in the same pass: a **color grade** (`color-grade` skill / EDL `grade`) and
+  **animated graphics** (`remotion-graphics`, optional — kinetic captions / animated lower-
+  thirds, composited as a layer); static labels stay in `video-overlay`.
+- Final join (when not using the EDL): `filter_complex concat` with `-c:a aac -ar 44100`
+  (re-encode) after any filtered/Grok/overlay segment.
 - Write the result to `outputs/`.
 - **Show only the finished video — never a partial render.** Build the whole pipeline through
   to the last encode, then present the single final file. (No half-painted previews; the
@@ -133,3 +181,10 @@ The point of this skill is the *method* (read → map → compose), so new genre
 - **Generative looks are optional and non-deterministic** — only reach for `grok-video-edit`
   when a style needs a reimagined look (recolor, smoke, restyle) that ffmpeg/overlays can't do;
   prefer the deterministic skills.
+- **Verify long concatenated renders with float timestamps + fps-dumps.** A bare integer to
+  `frame --at` is a *frame number*, not seconds — pass floats/`HH:MM:SS`. For auditing a 60-min
+  concat, `ffmpeg -ss T -i out.mp4 -t W -vf fps=N out_%03d.png` (a short window dump) is more
+  reliable than a single seeked frame; confirm cutaway/seam content this way before the final pass.
+- **Leave exactly one clearly-named final per deliverable; delete intermediates.** Multi-pass
+  edits spawn look-alike WIP files — if you leave `switched.mp4`/`raw.mp4` next to the final, the
+  user will open the wrong one and report "you didn't do X." Clean `outputs/` down to the finals.
