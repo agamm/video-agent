@@ -1075,6 +1075,40 @@ def edl_render(edl_path: str, out: str):
     W, H = edl.get("width", 1920), edl.get("height", 1080)
     vchain = _edl_vchain(W, H, fps)
 
+    # AV1 cannot be decoded by ffmpeg's trim filter on this platform — pre-transcode
+    # any AV1 clip segments to temp H.264 files so the filter_complex works cleanly.
+    _av1_tmp_dir = None
+    _av1_map: dict[tuple, tuple] = {}  # (abs_src, start, end) -> (tmp_path, 0.0, dur)
+
+    def _resolve_av1(src, start, end):
+        """Return (src, start, end) — transcoded to temp H.264 if source is AV1."""
+        nonlocal _av1_tmp_dir
+        info = video_info(src)
+        if info.get("codec", "").lower() != "av1":
+            return src, start, end
+        key = (os.path.abspath(src), float(start), float(end))
+        if key not in _av1_map:
+            if _av1_tmp_dir is None:
+                _av1_tmp_dir = tempfile.mkdtemp(prefix="edl_av1_")
+            tmp = os.path.join(_av1_tmp_dir, f"av1_{len(_av1_map)}.mp4")
+            print(f"  [edl] pre-transcoding AV1 clip {start:.1f}–{end:.1f}s → {tmp}")
+            trim(src, float(start), float(end), tmp)
+            _av1_map[key] = (tmp, 0.0, float(end) - float(start))
+        return _av1_map[key]
+
+    # Rewrite clips to use pre-transcoded paths where needed
+    resolved_clips = []
+    for c in clips:
+        rc = dict(c)
+        a_src2, a_s2, a_e2 = _resolve_av1(c["src"], c["start"], c["end"])
+        rc["src"], rc["start"], rc["end"] = a_src2, a_s2, a_e2
+        if "vsrc" in c:
+            v_src2, v_s2, v_e2 = _resolve_av1(
+                c["vsrc"], c.get("vstart", c["start"]), c.get("vend", c["end"]))
+            rc["vsrc"], rc["vstart"], rc["vend"] = v_src2, v_s2, v_e2
+        resolved_clips.append(rc)
+    clips = resolved_clips
+
     inputs: list[str] = []
     def _idx(path):
         ap = os.path.abspath(path)
@@ -1134,6 +1168,9 @@ def edl_render(edl_path: str, out: str):
         _run(cmd)
     finally:
         os.unlink(gfile)
+        if _av1_tmp_dir and os.path.isdir(_av1_tmp_dir):
+            import shutil as _shutil
+            _shutil.rmtree(_av1_tmp_dir, ignore_errors=True)
     return out
 
 

@@ -20,6 +20,18 @@ vision chat *could* caption frames if you were ever running fully headless with 
 read images, but that's the fallback, not the path — reading the frames directly is better and
 free.)
 
+## Step 0 — Scan `inputs/` for ALL assets
+
+**Before anything else**, run `ls inputs/` (or whatever directory holds the footage). Look for:
+- Multiple video files (multicam, cutaways, B-roll)
+- **Music / audio files** (`.mp3`, `.wav`, `.aac`, `.m4a`) — if one exists, it is almost
+  certainly the intended soundtrack bed; use it in the edit instead of inventing a music choice
+- LUT files (`.cube`, `.png` HALD) — pre-supplied color grade
+- SRT/VTT files — pre-supplied captions
+
+Do not proceed to Step 1 until you know every asset available. Missing a music file means the
+whole audio direction is wrong before you start.
+
 ## Step 1 — Understand the footage (local, no key)
 
 Gather three signals and form one paragraph "read" of the source before deciding anything:
