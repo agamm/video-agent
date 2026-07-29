@@ -1,28 +1,69 @@
+# secrets — every .env variant except the committed template
 .env
-.venv/
-__pycache__/
-*.egg-info/
-.pytest_cache/
-.DS_Store
+.env.*
+!.env.example
 
-# media — never commit
+# python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# os / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# working media — never commit (source footage and renders are private by default)
 inputs/
 outputs/
 grids/
 *.mp4
-*.aac
 *.mov
 *.avi
 *.mkv
+*.webm
+*.m4v
+*.mp3
+*.wav
+*.aac
+*.m4a
+*.flac
+*.ogg
 *.png
 *.jpg
 *.jpeg
 *.gif
+*.webp
 
-# claude code — keep skills tracked, ignore local state
+# transcript / caption sidecars — these contain everything that was said on camera
+*.srt
+*.vtt
+mapping.json
+
+# working edit artifacts — these name your private source files in every clip entry.
+# Committed examples live in examples/ and are unaffected by these root-level patterns.
+edit.json
+edit_*.json
+*_edit.json
+snapped.json
+beats.txt
+
+# ...but allow committed docs assets (screenshots, demo GIFs) to override the media rules
+!docs/**
+
+# claude code — keep skills tracked, ignore local state (settings.local.json, history, etc.)
 .claude/*
 !.claude/skills/
 
 # remotion (optional graphics) build artifacts
-remotion/node_modules/
+node_modules/
 remotion/out/

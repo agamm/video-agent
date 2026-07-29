@@ -90,6 +90,13 @@ if you need to tune the threshold: `ffmpeg -i in.mp4 -af silencedetect=noise=-30
 6. If real speech is missing → restore that cut from the original and iterate.
 7. Done when: every preview sounds natural AND the re-transcription matches intent.
 
+## After the fillers are gone: pacing
+
+Removing um/uh leaves the *gaps* where they were. If the result still drags, that's a pacing
+problem, not a filler problem — run `tighten` (collapses long pauses to a natural beat,
+writing an EDL) and add split edits. Both live in the `cutting-rhythm` skill. Order matters:
+filler-removal first, then tighten, or you'll tighten around words you're about to cut.
+
 ## Reference
 
 - Word-timestamp output format: `start_sec  end_sec  word` (tab-separated, one per line).

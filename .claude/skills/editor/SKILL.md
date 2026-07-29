@@ -1,6 +1,6 @@
 ---
 name: editor
-description: Turn raw footage into a finished edit in a specific genre/format — montage, documentary, tutorial, news, workshop, vlog, trailer, explainer. Use whenever the user wants the video "edited into a X", asks "what style should this be / what would make a good X", or hands over raw footage without spelling out every cut. This is the director: it understands the footage first, picks a treatment, then composes the other skills (edl-edit, filler-removal, captions, reframe-social, video-transitions, video-overlay, audio-edit, color-grade, remotion-graphics, grok-video-edit) to execute it.
+description: Turn raw footage into a finished edit in a specific genre/format — montage, documentary, tutorial, news, workshop, vlog, trailer, explainer. Use whenever the user wants the video "edited into a X", asks "what style should this be / what would make a good X", or hands over raw footage without spelling out every cut. This is the director: it understands the footage first, picks a treatment, then composes the other skills (edl-edit, cutting-rhythm, filler-removal, captions, reframe-social, video-transitions, video-overlay, audio-edit, color-grade, remotion-graphics, grok-video-edit) to execute it.
 ---
 
 # Editor — understand the footage, then edit it to a style
@@ -70,35 +70,45 @@ fits:
 
 **Universal order of operations** — do not reorder; getting it wrong forces re-renders:
 
-> **content cuts** (trim · filler-removal · highlight-select) → **structure** (concat ·
-> transitions) → **reframe** → **audio** (normalize · music bed) → **overlays/captions LAST**
-> → **single final encode**.
+> **content cuts** (trim · filler-removal · highlight-select) → **rhythm** (tighten · split
+> edits · beat-snap) → **structure** (transitions) → **reframe** → **audio** (normalize ·
+> music bed) → **overlays/captions LAST** → **single final encode**.
 
 Why last-things-last: captions must be burned at final resolution (font size/wrapping follow
 the output frame), and audio music-bed ducking needs the final speech track. Re-encode any
 join *after a filtered segment* with `filter_complex concat` (CLAUDE.md: stream-copy concat
 freezes at non-keyframe seams; re-encode audio to kill drift).
 
+**Rhythm is a step, not a side effect.** Picking the right moments gets you an accurate edit;
+it does not get you a watchable one. After the content cuts and before anything visual, run
+the `cutting-rhythm` skill: collapse dead air (`tighten`), add `audio_lead` split edits so the
+cuts stop slamming, vary the shot lengths, and snap to the music grid if there's a bed. Check
+it with `edl --report --dry-run` before you render — it names the three failure modes for you.
+
 ### Montage — fast, kinetic, music-driven (~20–60s)
 - **Select beats**: from the transcript pull the punchiest 4–10 lines; from `detect` pull
   high-motion / expressive frames. `trim` each beat short (1–3s).
 - **Join** with hard cuts, or quick `video-transitions` (slide/pixelize) for energy.
-- **Music bed** under everything (`audio-edit`); if any speech is kept, duck it. Cut on the
-  beat where you can.
-- Optional **speed ramps** (`setpts=0.5*PTS` + `atempo`), punch-in `reframe --mode crop`, and
-  big kinetic `overlay-text` hits.
+- **Music bed** in the EDL's `music` field (looped, ducked, same render pass). Then actually
+  cut on the beat: `beats` → `snap --to beats` (see `cutting-rhythm`), don't eyeball it.
+- **Shot lengths must shorten toward the climax** — an all-1.5s montage is monotone.
+- Optional **speed ramps** (`setpts=0.5*PTS` + `atempo`), per-clip `punch`, and big kinetic
+  `overlay-text` hits.
 
 ### Documentary — narrative, slower, cinematic
 - **Keep the arc**; clean disfluencies with `filler-removal` (don't gut content).
+- **L-cuts carry the narration over the pictures** — set `audio_lead` negative on B-roll
+  clips so the voice continues across the visual change. This is what makes doc cutting feel
+  seamless; hard butt cuts make it feel like a slideshow.
 - **Crossfades/dissolves** between sections (`video-transitions` xfade, or `splice` for a soft
   seam).
 - **Lower-thirds**: name + title via `video-overlay`; section/chapter title cards.
-- **Music bed ducked** under voice + `loudnorm` (`audio-edit`). Optional cinematic grade
-  (`eq=contrast=1.05:saturation=0.95`). Clean `captions` optional.
+- **Music bed ducked** under voice + `loudnorm`. Optional cinematic grade. Clean `captions`
+  optional. `tighten --target-gap 0.7` — let it breathe.
 
 ### Tutorial — clarity first
-- `filler-removal` (tight) and **speed up dead air**. Keep screen content readable: reframe
-  with `--mode pad` (never crop UI off).
+- `filler-removal` (tight), then `tighten --target-gap 0.35` to kill dead air. Keep screen
+  content readable: reframe with `--mode pad` (never crop UI off).
 - **Step/section title cards** (`overlay-text`, numbered). **Zoom/punch-in** on the region
   that matters — use `position-grid` to find it, then crop + scale there.
 - **Clean captions** (`captions --clean`) + `loudnorm`.
@@ -120,10 +130,11 @@ The point of this skill is the *method* (read → map → compose), so new genre
 - **Vlog** — personable: jump-cuts, light music, `captions`, occasional `overlay-text` asides.
 - **Trailer** — dramatic: music-driven, escalating fast cuts, big `overlay-text`, `xfade`
   transitions (`fade`/`pixelize`) between beats, fade-from-black in / fade-to-black out. Hook in
-  the first 2s. For the bed: profile a music track's energy (RMS per second) and take a segment
-  whose **build peaks at your climax beat** (the payoff/button); lay it under via the
-  `audio-edit` duck recipe so soundbites stay clear. Keep the key spoken lines, not full
-  sentences.
+  the first 2s. Structure: **hook (≤2s) → build → turn → climax (fastest cutting) → button
+  (one held shot + title)**; shot lengths shorten through the build and the button holds. For
+  the bed: profile a music track's energy (RMS per second) and take a segment whose **build
+  peaks at your climax beat** (the payoff/button); put it in the EDL's `music` field and
+  `snap --to beats` so the cuts land on it. Keep the key spoken lines, not full sentences.
 - **Explainer-short** — `reframe 9:16`, hook line as `overlay-text` in first 2s, `captions`
   (clean, karaoke-style if time allows), ruthless tightening to <60s.
 
@@ -156,12 +167,20 @@ rarely frame-aligned, especially if one was trimmed (de-sensitized, ad breaks, e
 
 ## Pacing cleanup (remove dead air)
 
-"Lightly cleaned" usually means collapsing long pauses, not cutting content. Run
-`silencedetect` (`-af silencedetect=noise=-30dB:d=1.0`), build a keep-list that shortens each
-gap over the threshold to ~0.4–0.7 s, and `concat` the keep-segments. Conservative thresholds
-(≥1 s) avoid clipping breaths; verify a couple of cuts don't truncate a burned-in caption.
-This is distinct from `filler-removal` (which cuts spoken um/uh) — silence collapse leaves the
-words, just tightens the gaps.
+"Lightly cleaned" usually means collapsing long pauses, not cutting content — that's the
+`tighten` command, which writes an EDL rather than a video so the pacing stays reviewable:
+
+```bash
+uv run video-agent tighten talk.mp4 -o edit.json --target-gap 0.5 --min-gap 1.0
+uv run video-agent edl edit.json -o out.mp4 --report
+```
+
+It removes time from the *middle* of each long pause so breaths survive at both ends.
+Conservative `--min-gap` (≥1 s) avoids clipping them; verify a couple of cuts don't truncate a
+burned-in caption. This is distinct from `filler-removal` (which cuts spoken um/uh) — silence
+collapse leaves the words, just tightens the gaps. **Then widen back out the pauses that are
+doing work** (after a punchline or reveal) — uniform pacing is what makes an edit sound
+machine-made. See `cutting-rhythm` for the per-genre gap targets.
 
 ## Step 4 — Assemble and deliver ONE finished video
 

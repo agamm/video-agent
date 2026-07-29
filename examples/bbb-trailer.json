@@ -1,0 +1,132 @@
+{
+  "_comment": "Big Buck Bunny — 30s trailer. Structure: hook/world (0-12.3s) -> turn under the music's near-silent riser (12.3-16.33s) -> climax on the slam (16.33-23.5s) -> payoff + button (23.5-30s). Every cut from 16.33s on sits on the bed's 83.2bpm climax pulse (0.7215s, anchored to the 16.347s hit) and is then quantized to the 24fps frame grid, so no cut lands >21ms off its beat. Source audio is muted via audio_fix — BBB's own orchestral score would fight the trailer bed — so the bed carries the whole track.",
+  "_bed_recipe": "outputs/ is gitignored, so rebuild the bed before rendering. It splices trailer_music.mp3's gentle intro onto its natural break-and-slam so the drop lands on the trailer's turn: segment A = 10.9-22.9s (quiet build), segment B = 61.0-80.0s (decay -> near-silent riser at 62-65 -> slam at 65.36 -> climax). 15ms fades kill the splice click; 31s total so the EDL's 30s atrim never wraps.  ffmpeg -y -i inputs/trailer_music.mp3 -filter_complex \"[0:a]atrim=10.9:22.9,asetpts=PTS-STARTPTS,afade=t=out:st=11.985:d=0.015[a1];[0:a]atrim=61.0:80.0,asetpts=PTS-STARTPTS,afade=t=in:st=0:d=0.015[a2];[a1][a2]concat=n=2:v=0:a=1[out]\" -map \"[out]\" -c:a pcm_s16le -ar 48000 outputs/_bed.wav",
+  "_finish": "The `edl` render has no fade hook, so the delivered file gets one extra video-only pass (audio stream-copied):  ffmpeg -i outputs/_trailer_nofade.mp4 -vf \"fade=t=in:st=0:d=0.5,fade=t=out:st=29.3:d=0.7\" -c:v h264_videotoolbox -b:v 9M -c:a copy -movflags +faststart outputs/bbb_trailer.mp4",
+  "fps": 24,
+  "width": 1920,
+  "height": 1080,
+  "seam_fade": 0.015,
+  "audio_fix": "volume=-60dB",
+  "music": {
+    "src": "outputs/_bed.wav",
+    "start": 0.0,
+    "gain_db": -1.0,
+    "duck": false,
+    "fade_in": 0.8,
+    "fade_out": 1.2
+  },
+  "clips": [
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 5.4,
+      "end": 8.4,
+      "rationale": "ACT 1 / establishing. Pastel dawn meadow and pines — the longest shot in the cut (3.0s) so the trailer opens calm and wide. Sets the peaceful world the villains will wreck."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 12.4,
+      "end": 14.98333,
+      "rationale": "ACT 1. Brook and wildflowers — texture of the world, keeps the open unhurried while the bed is still a quiet build."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 44.9,
+      "end": 47.4,
+      "punch": [1.0, 1.05],
+      "rationale": "ACT 1 / hero reveal. Bunny emerges from the dark burrow. Slow 5% push draws the eye into the shadow as his face resolves."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 61.0,
+      "end": 63.20833,
+      "rationale": "ACT 1. Warm close-up, content and smiling under blue sky — establishes he's gentle, which is what makes the turn land."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 106.8,
+      "end": 108.8,
+      "rationale": "ACT 1 close. Butterfly settles on him — plants what he loves, so its destruction reads as the inciting wound."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 192.75,
+      "end": 194.625,
+      "rationale": "ACT 2 / the threat, landing as the bed drops to near-silence (0.02 RMS). Squirrel's grin with the butterfly captive. Held in the quiet so it reads as menace, not noise. Ends at 194.63 — the film cuts away at ~194.7."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 197.1,
+      "end": 199.26667,
+      "rationale": "ACT 2 / the loss. Bunny shocked, reaching out helplessly. Runs out under the riser so the audience arrives at the slam already angry on his behalf."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 235.6,
+      "end": 237.05833,
+      "punch": [1.0, 1.06],
+      "rationale": "ACT 3 / THE SLAM (out 16.333s). His face hardens. This cut is the trailer's hinge — placed on the bed's re-entry hit at 16.347s. 6% push in on the scowl."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 257.0,
+      "end": 258.45833,
+      "rationale": "ACT 3. Carving a sharpened stake in the woods — the clearest 'he is arming up' image in the film. 2 beats."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 424.9,
+      "end": 426.31667,
+      "rationale": "ACT 3. Flying squirrel gliding, oblivious. Last 2-beat shot before the cutting doubles in speed."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 394.9,
+      "end": 395.65,
+      "rationale": "ACT 3 / acceleration begins — 1 beat. Squirrel snarls. Shots now change on every pulse."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 420.9,
+      "end": 421.60833,
+      "rationale": "ACT 3 — 1 beat. Apple slams into the spike trap: the trap works, without spoiling how."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 448.95,
+      "end": 449.65833,
+      "rationale": "ACT 3 — 1 beat. Squirrel dangling above the spikes. Peril at maximum, cutting at maximum."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 480.95,
+      "end": 481.65833,
+      "rationale": "ACT 3 — 1 beat, the shortest hold in the cut. Extreme close-up, eyes bugging: the 'oh no' frame right before the payoff."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 481.95,
+      "end": 483.40833,
+      "rationale": "ACT 4 / money shot. Squirrel launched across the sky. Cutting drops back to 2 beats — the deceleration is what makes it land."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 484.25,
+      "end": 485.70833,
+      "rationale": "ACT 4 / the joke. Wide: the bunny is flying him like a kite. This is the film's actual gag and the reason the trailer is funny rather than just vengeful."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 471.4,
+      "end": 472.81667,
+      "punch": [1.0, 1.04],
+      "rationale": "ACT 4 / button. His satisfied smile — closes the emotional loop opened by the close-up at 61s."
+    },
+    {
+      "src": "inputs/Big Buck Bunny.mp4",
+      "start": 26.2,
+      "end": 28.325,
+      "punch": [1.0, 1.03],
+      "rationale": "ACT 4 / title. The film's own 'Big Buck Bunny' card, held 2.1s — the longest shot since the opening, so the trailer lands rather than just stops."
+    }
+  ]
+}

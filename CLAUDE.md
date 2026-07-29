@@ -30,8 +30,13 @@ A technique that's just a one-line ffmpeg invocation lives in a skill, **not** a
 - **`reframe-social`** — reframing to 9:16 / 1:1 / 4:5 for Reels/Shorts/TikTok, including
   keeping an off-center or moving subject in frame.
 - **`edl-edit`** — assemble a multi-clip edit as an auditable `edit.json` (clips + in/out +
-  written rationale, incl. multicam `vsrc` cutaways) that the `edl` command renders in one
-  pass. Reach for this for any multi-cut stitch instead of a throwaway filtergraph.
+  written rationale, incl. multicam `vsrc` cutaways, split edits, music bed) that the `edl`
+  command renders in one pass. Reach for this for any multi-cut stitch instead of a throwaway
+  filtergraph.
+- **`cutting-rhythm`** — making a *correct* edit feel flowing/natural/snappy: split edits
+  (J/L cuts via `audio_lead`), where a cut goes relative to speech and motion, pause length
+  (`tighten`), shot-length variety, and cutting on the beat (`beats` + `snap`). Reach for this
+  whenever an edit is technically right but watches badly, or before finalizing any multi-cut.
 - **`color-grade`** — apply a look / `.cube`/HALD LUT, or render candidate looks to pick from
   (`grade` command). NOTE: this is an LGPL ffmpeg — **no `eq`/`drawtext` filters**; grade with
   curves/colorbalance/colorchannelmixer/lut3d/haldclut.
@@ -143,9 +148,35 @@ uv run video-agent splice a.mp4 b.mp4 -o out.mp4
 
 # edl — execute an edit.json (clip list + rationale) → one video. See edl-edit skill.
 uv run video-agent edl edit.json -o out.mp4
-#   clips: [{src,start,end,rationale, (opt) vsrc/vstart/vend for a multicam cutaway}],
-#   plus optional fps/width/height/grade(LUT)/audio_fix. Frame-accurate, one re-encode.
+uv run video-agent edl edit.json -o out.mp4 --report        # + pacing table & rhythm warnings
+uv run video-agent edl edit.json -o /dev/null --report --dry-run   # pacing only, no render
+uv run video-agent edl edit.json -o draft.mp4 --draft       # fast 480p, verification ONLY
+#   clips: [{src,start,end,rationale, (opt) vsrc/vstart/vend multicam cutaway,
+#            audio_lead (J/L split edit, + = sound early), punch (slow push)}],
+#   plus optional fps/width/height/grade(.cube or HALD .png)/audio_fix/seam_fade/vbitrate/music.
+#   Video+audio concat as INDEPENDENT chains (so audio_lead can't desync); every boundary is
+#   quantized to the frame grid. One re-encode — incl. the grade and the music bed.
+#   vbitrate defaults to "9M" — fine for camera footage, too low for a 4K SCREENCAST (small
+#   terminal text goes mushy). Raise it to ~24M when the source is a screen recording.
+#   To burn an overlay into ONE clip without a second full-length encode: pre-render just
+#   that window as its own segment file (trim+overlay, split points on silence boundaries so
+#   seam_fade can't notch a word) and list it as an extra clip — see edit_video_agent.json.
 #   VERIFY by re-transcribing the output: transcribe out.mp4 --clean.
+
+# tighten — collapse dead air to a natural beat → writes an edit.json (not a video)
+uv run video-agent tighten talk.mp4 -o edit.json --target-gap 0.5 --min-gap 1.0
+#   Removes time from the MIDDLE of each long pause so breaths survive at both ends.
+#   Distinct from filler-removal (which cuts spoken um/uh) — every word stays. --trim-ends
+#   also drops leading/trailing silence. Per-genre gap targets: cutting-rhythm skill.
+
+# beats — musical beat grid + tempo (numpy/scipy; no new deps, no key)
+uv run video-agent beats inputs/music.mp3 [-o beats.txt] [--onsets]
+
+# snap — move an EDL's cut points onto silence edges or musical beats, printing every move
+uv run video-agent snap edit.json -o snapped.json --to silence
+uv run video-agent snap edit.json -o snapped.json --to beats --ref music.mp3 --tolerance 0.4
+#   `beats` snaps on the OUTPUT timeline (what "cut on the beat" means); pass --offset if the
+#   bed starts partway in. Cuts with no candidate inside --tolerance are left alone.
 
 # grade — color grade via .cube/HALD LUTs (see color-grade skill)
 uv run video-agent grade apply in.mp4 --lut luts/warm.png -o out.mp4
@@ -261,3 +292,13 @@ position). Cross-check with `detect` (reads sequentially, no seeking) if a frame
 - **Verify timing by dumping frames sequentially.** `ffmpeg -i out.mp4 -vf fps=10
   /tmp/f_%03d.png` gives reliable frame-to-timestamp correspondence — better than a single
   seeked frame for auditing cut/overlay timing on re-encoded sources.
+- **A cut point that isn't on the frame grid splits picture from sound.** Video can only cut
+  on a frame; audio can cut anywhere, so a fractional in/out leaves them up to a frame apart
+  — and across many clips that accumulates into visible drift. `edl` quantizes every boundary
+  for you; in hand-rolled filtergraphs, round cut times to `round(t*fps)/fps` yourself. Check
+  with `ffprobe -show_entries stream=codec_type,duration` and compare the two streams.
+
+### Editorial
+- **An accurate cut is not a good cut.** Correct in/out points still watch badly if every cut
+  changes picture and sound on the same frame, every pause is full length, and every shot is
+  the same duration. That's the `cutting-rhythm` skill — `edl --report` diagnoses all three.

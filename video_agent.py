@@ -13,6 +13,10 @@ CLI:
     uv run video-agent trim <src> --start S --end E -o out.mp4
     uv run video-agent frame <src> --at T -o frame.png
     uv run video-agent concat a.mp4 b.mp4 ... -o out.mp4
+    uv run video-agent edl edit.json -o out.mp4 [--report] [--draft]
+    uv run video-agent tighten <src> -o edit.json        # collapse dead air → an EDL
+    uv run video-agent beats <music> [-o beats.txt]      # tempo + beat grid
+    uv run video-agent snap edit.json -o snapped.json --to silence|beats
     uv run video-agent vfx-edit <src> --prompt "Make sunglasses red" -o out.mp4   # optional; needs [vfx] extra + API key
 
 Position values: bare integer = frame number; float or HH:MM:SS = seconds.
@@ -1039,23 +1043,136 @@ _VFX_BACKENDS = {"grok": grok_edit}
 # ---------------------------------------------------------------------------
 
 # Normalize every segment to a common geometry so concat never desyncs / errors.
-def _edl_vchain(W, H, fps):
-    return (f"setpts=PTS-STARTPTS,fps={fps},"
-            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p")
+def _edl_vchain(W, H, fps, punch=None, nframes=None):
+    """Video filter chain for one EDL segment.
+
+    `punch` is an optional (z_start, z_end) slow push (see `punch` in the EDL schema).
+    The pre-scale to 2×  is what keeps zoompan smooth: zoompan rounds its crop origin to
+    whole pixels, so pushing directly on a W×H frame visibly stair-steps.
+    """
+    chain = (f"setpts=PTS-STARTPTS,fps={fps},"
+             f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1")
+    if punch:
+        z0, z1 = punch
+        n = max(1, int(nframes or 1))
+        chain += (f",scale={W*2}:{H*2},"
+                  f"zoompan=z='{z0:.6f}+({z1:.6f}-{z0:.6f})*min(on/{n},1)':d=1:"
+                  f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={fps}")
+    return chain + ",format=yuv420p"
 
 
-def edl_render(edl_path: str, out: str):
+def _edl_achain(a_s, a_e, seam_fade, fade_in, fade_out):
+    """Audio filter chain for one EDL segment, with short fades at the internal seams.
+
+    Butt-splicing two audio segments mid-waveform steps the signal discontinuously and
+    clicks. A fade shorter than a syllable (~15 ms) is inaudible as a fade but removes the
+    step entirely — so every internal boundary gets one, at no cost in duration.
+    """
+    dur = a_e - a_s
+    parts = [f"atrim={a_s:.3f}:{a_e:.3f}", "asetpts=PTS-STARTPTS"]
+    if seam_fade > 0 and dur > 2 * seam_fade:
+        if fade_in:
+            parts.append(f"afade=t=in:st=0:d={seam_fade:.4f}")
+        if fade_out:
+            parts.append(f"afade=t=out:st={dur - seam_fade:.4f}:d={seam_fade:.4f}")
+    parts.append("aformat=channel_layouts=stereo:sample_rates=48000")
+    return ",".join(parts)
+
+
+def _edl_audio_windows(clips):
+    """Resolve each clip's audio in/out from `audio_lead` → [(a_start, a_end), …].
+
+    `audio_lead` is what makes a cut a **split edit**: it moves the audio edit point off
+    the picture edit point. +0.4 = this clip's sound arrives 0.4 s before its picture
+    (J-cut); -0.4 = the previous clip's sound holds 0.4 s over this picture (L-cut).
+
+    Clip i's audio therefore runs [start_i − lead_i, end_i − lead_{i+1}]. The leads
+    telescope, so total audio length still equals total video length even though
+    individual segments no longer match — which is exactly why the renderer concatenates
+    video and audio as two independent chains.
+    """
+    n = len(clips)
+    leads = []
+    for i, c in enumerate(clips):
+        lead = float(c.get("audio_lead", 0.0))
+        if i == 0 and lead:
+            print("  [edl] ignoring audio_lead on clip 0 — nothing precedes it to split against")
+            lead = 0.0
+        leads.append(lead)
+    leads.append(0.0)                      # sentinel: nothing follows the last clip
+
+    windows = []
+    for i, c in enumerate(clips):
+        a_s = float(c["start"]) - leads[i]
+        a_e = float(c["end"]) - leads[i + 1]
+        if a_s < 0:
+            raise ValueError(
+                f"clip {i}: audio_lead {leads[i]}s reaches before the start of {c['src']} "
+                f"(audio in would be {a_s:.3f}s). Use a smaller lead or a later in-point.")
+        if a_e - a_s < 0.05:
+            raise ValueError(
+                f"clip {i}: audio_lead leaves only {a_e - a_s:.3f}s of audio "
+                f"({a_s:.3f}→{a_e:.3f}). Neighbouring leads are eating the whole clip.")
+        windows.append((a_s, a_e))
+    return windows
+
+
+def _edl_quantize(clips, fps):
+    """Round every cut point onto the frame grid.
+
+    Video can only cut on a frame boundary; audio can cut anywhere. A cut point that sits
+    between frames therefore lands in two slightly different places in the two streams, and
+    across a cut list those fractions accumulate into real A/V drift — which is easy to hit
+    now that `snap`/`tighten` write times derived from beats and silence rather than from
+    round numbers. Quantizing up front makes both timelines agree exactly, for every EDL
+    regardless of what produced it.
+    """
+    def q(t):
+        return round(float(t) * fps) / fps       # full precision — rounding for looks here
+                                                 # would put the value back off the grid
+    out = []
+    for c in clips:
+        rc = dict(c)
+        for k in ("start", "end", "vstart", "vend", "audio_lead"):
+            if k in rc:
+                rc[k] = q(rc[k])
+        out.append(rc)
+    return out
+
+
+def _edl_check_cutaway(i, clip, fps):
+    """A `vsrc` cutaway must be the same length as the audio it covers, or the picture
+    after it lands off its sound and every later cut inherits the drift."""
+    if "vsrc" not in clip:
+        return
+    v_dur = float(clip.get("vend", clip["end"])) - float(clip.get("vstart", clip["start"]))
+    a_dur = float(clip["end"]) - float(clip["start"])
+    if abs(v_dur - a_dur) > 1.0 / fps:
+        raise ValueError(
+            f"clip {i}: vsrc window is {v_dur:.3f}s but the clip covers {a_dur:.3f}s of "
+            f"audio. A cutaway swaps the picture only — the two must match (fix vstart/vend).")
+
+
+def edl_render(edl_path: str, out: str, draft: bool = False):
     """Execute an edit.json (Edit Decision List) → one re-encoded video.
 
     Schema (see the edl-edit skill):
       {
         "fps": 60, "width": 1920, "height": 1080,   # all optional (defaults shown)
-        "grade": "luts/warm.cube",                   # optional LUT applied to the whole cut
-        "audio_fix": "loudnorm=I=-14:TP=-1.5:LRA=11",# optional final audio filter chain
+        "grade": "luts/warm.cube",                   # optional LUT (.cube or HALD .png)
+        "audio_fix": "loudnorm=I=-14:TP=-1.5:LRA=11",# optional filter chain on the speech bus
+        "seam_fade": 0.015,                          # optional click-killing fade at each cut
+        "vbitrate": "9M",                            # optional; raise for 4K/screencast text
+        "music": {"src": "bed.mp3", "gain_db": -18, "duck": true,
+                  "start": 0.0, "fade_in": 0.5, "fade_out": 2.0},   # optional music bed
         "clips": [
           {"src": "a.mp4", "start": 1.89, "end": 60.81,
            "first_words": "Hey everyone", "rationale": "cleanest take, zero ums"},
+          # split edit — this clip's sound arrives 0.4s before its picture (J-cut):
+          {"src": "b.mp4", "start": 12.0, "end": 20.0, "audio_lead": 0.4,
+           "punch": [1.0, 1.06],                      # optional slow push over the clip
+           "rationale": "answer starts under the end of the question"},
           # multicam cutaway — audio from src, picture from a second camera:
           {"src": "a.mp4", "start": 70.0, "end": 78.0,
            "vsrc": "roomcam.mp4", "vstart": 141.3, "vend": 149.3,
@@ -1064,8 +1181,12 @@ def edl_render(edl_path: str, out: str):
       }
     `start`/`end` (and `vstart`/`vend`) are seconds (floats) on the SOURCE timeline; cuts are
     frame-accurate (trim filter, not -ss seeking). `rationale`/`first_words` are documentation
-    only — ignored by the renderer, read by humans. Every boundary is exact source-time so the
-    continuous audio stays gapless. After rendering, VERIFY by re-transcribing `out`.
+    only — ignored by the renderer, read by humans. After rendering, VERIFY by re-transcribing
+    `out`.
+
+    Video and audio are concatenated as **two independent chains**, so `audio_lead` can move
+    the sound edit off the picture edit (J/L cuts) without desyncing anything downstream.
+    `draft` renders small and cheap for the internal verify loop — never as a deliverable.
     """
     edl = json.load(open(edl_path))
     clips = edl["clips"]
@@ -1073,41 +1194,44 @@ def edl_render(edl_path: str, out: str):
         raise ValueError("EDL has no clips")
     fps = edl.get("fps", 60)
     W, H = edl.get("width", 1920), edl.get("height", 1080)
-    vchain = _edl_vchain(W, H, fps)
+    seam_fade = float(edl.get("seam_fade", 0.015))
+    # 9M is fine for camera footage; screencasts with small text need more to stay legible.
+    vbitrate = str(edl.get("vbitrate", "9M"))
+    if draft:
+        H = 480
+        W = max(2, round(edl.get("width", 1920) * H / edl.get("height", 1080) / 2) * 2)
+        vbitrate = "1500k"
+        print(f"  [edl] DRAFT render at {W}x{H} — for verification only, not a deliverable")
+
+    # Resolve the audio timeline BEFORE any pre-transcoding: `audio_lead` reaches outside a
+    # clip's picture range, so the ranges have to be known before we decide what to extract.
+    # Validating here also means errors name the real source, not a temp file.
+    n = len(clips)
+    clips = _edl_quantize(clips, fps)
+    windows = _edl_audio_windows(clips)
+    for i, c in enumerate(clips):
+        _edl_check_cutaway(i, c, fps)
 
     # AV1 cannot be decoded by ffmpeg's trim filter on this platform — pre-transcode
     # any AV1 clip segments to temp H.264 files so the filter_complex works cleanly.
     _av1_tmp_dir = None
-    _av1_map: dict[tuple, tuple] = {}  # (abs_src, start, end) -> (tmp_path, 0.0, dur)
+    _av1_map: dict[tuple, tuple] = {}   # (abs_src, t0, t1) -> (tmp_path, offset)
 
-    def _resolve_av1(src, start, end):
-        """Return (src, start, end) — transcoded to temp H.264 if source is AV1."""
+    def _resolve_av1(src, t0, t1):
+        """Return (path, offset) for the range [t0, t1] — `offset` is the source time at
+        the returned file's t=0, so caller times map as `t - offset`."""
         nonlocal _av1_tmp_dir
-        info = video_info(src)
-        if info.get("codec", "").lower() != "av1":
-            return src, start, end
-        key = (os.path.abspath(src), float(start), float(end))
+        if video_info(src).get("codec", "").lower() != "av1":
+            return src, 0.0
+        key = (os.path.abspath(src), round(float(t0), 3), round(float(t1), 3))
         if key not in _av1_map:
             if _av1_tmp_dir is None:
                 _av1_tmp_dir = tempfile.mkdtemp(prefix="edl_av1_")
             tmp = os.path.join(_av1_tmp_dir, f"av1_{len(_av1_map)}.mp4")
-            print(f"  [edl] pre-transcoding AV1 clip {start:.1f}–{end:.1f}s → {tmp}")
-            trim(src, float(start), float(end), tmp)
-            _av1_map[key] = (tmp, 0.0, float(end) - float(start))
+            print(f"  [edl] pre-transcoding AV1 {t0:.1f}–{t1:.1f}s → {tmp}")
+            trim(src, float(t0), float(t1), tmp)
+            _av1_map[key] = (tmp, float(t0))
         return _av1_map[key]
-
-    # Rewrite clips to use pre-transcoded paths where needed
-    resolved_clips = []
-    for c in clips:
-        rc = dict(c)
-        a_src2, a_s2, a_e2 = _resolve_av1(c["src"], c["start"], c["end"])
-        rc["src"], rc["start"], rc["end"] = a_src2, a_s2, a_e2
-        if "vsrc" in c:
-            v_src2, v_s2, v_e2 = _resolve_av1(
-                c["vsrc"], c.get("vstart", c["start"]), c.get("vend", c["end"]))
-            rc["vsrc"], rc["vstart"], rc["vend"] = v_src2, v_s2, v_e2
-        resolved_clips.append(rc)
-    clips = resolved_clips
 
     inputs: list[str] = []
     def _idx(path):
@@ -1123,35 +1247,94 @@ def edl_render(edl_path: str, out: str):
 
     audio_cache: dict[str, bool] = {}
     need_silence = False
-    parts, labels = [], []
+    parts = []
     for i, c in enumerate(clips):
-        a_src, a_s, a_e = c["src"], float(c["start"]), float(c["end"])
-        v_src = c.get("vsrc", a_src)
-        v_s = float(c.get("vstart", a_s))
-        v_e = float(c.get("vend", a_e))
+        a_s, a_e = windows[i]
+        v_s = float(c.get("vstart", c["start"]))
+        v_e = float(c.get("vend", c["end"]))
+
+        # For AV1, extract once per clip covering picture AND sound (a J-cut's audio starts
+        # before its picture, so extracting only the picture range would cut it off).
+        if "vsrc" in c:
+            v_src, v_off = _resolve_av1(c["vsrc"], v_s, v_e)
+            a_src, a_off = _resolve_av1(c["src"], a_s, a_e)
+        else:
+            a_src, a_off = _resolve_av1(c["src"], min(a_s, v_s), max(a_e, v_e))
+            v_src, v_off = a_src, a_off
+        v_s, v_e = v_s - v_off, v_e - v_off
+        a_s, a_e = a_s - a_off, a_e - a_off
         vi, ai = _idx(v_src), _idx(a_src)
-        parts.append(f"[{vi}:v]trim={v_s:.3f}:{v_e:.3f},{vchain}[v{i}]")
+
+        punch = c.get("punch")
+        if punch is not None:
+            punch = (1.0, float(punch)) if isinstance(punch, (int, float)) else \
+                    (float(punch[0]), float(punch[1]))
+        vchain = _edl_vchain(W, H, fps, punch=punch,
+                             nframes=round((v_e - v_s) * fps))
+        # Nudge the out-point a quarter-frame inside: `trim` compares t < end in floating
+        # point, so a frame sitting exactly on a quantized boundary is sometimes admitted
+        # and sometimes not, leaving the picture a frame longer than the sound.
+        parts.append(f"[{vi}:v]trim={v_s:.4f}:{v_e - 0.25 / fps:.4f},{vchain}[v{i}]")
+
         ap = os.path.abspath(a_src)
         if ap not in audio_cache:
             audio_cache[ap] = _has_audio(a_src)
+        achain = _edl_achain(a_s, a_e, seam_fade,
+                             fade_in=i > 0, fade_out=i < n - 1)
         if audio_cache[ap]:
-            parts.append(f"[{ai}:a]atrim={a_s:.3f}:{a_e:.3f},asetpts=PTS-STARTPTS,"
-                         f"aformat=channel_layouts=stereo:sample_rates=48000[a{i}]")
+            parts.append(f"[{ai}:a]{achain}[a{i}]")
         else:  # silent source (e.g. a title card) → synthesize silence of the clip's length
             need_silence = True
-            parts.append(f"[__SIL__:a]atrim=0:{a_e - a_s:.3f},asetpts=PTS-STARTPTS,"
-                         f"aformat=channel_layouts=stereo:sample_rates=48000[a{i}]")
-        labels.append(f"[v{i}][a{i}]")
+            parts.append(f"[__SIL__:a]"
+                         + _edl_achain(0.0, a_e - a_s, seam_fade,
+                                       fade_in=i > 0, fade_out=i < n - 1)
+                         + f"[a{i}]")
 
-    graph = ";".join(parts) + ";" + "".join(labels)
-    graph += f"concat=n={len(clips)}:v=1:a=1[vc0][ac0]"
+    # Two independent concat chains: `audio_lead` makes per-segment A and V lengths differ
+    # (they only telescope back to equal *totals*), so a single v=1:a=1 concat would drift.
+    graph = ";".join(parts)
+    graph += ";" + "".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vc0]"
+    graph += ";" + "".join(f"[a{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1[ac0]"
+
     vmap, amap = "[vc0]", "[ac0]"
     if edl.get("grade"):
-        graph += f";[vc0]lut3d={edl['grade']}[vc]"; vmap = "[vc]"
+        lut = edl["grade"]
+        if lut.lower().endswith(".png"):        # HALD-CLUT is an image input, not a param
+            graph += f";[vc0][{_idx(lut)}:v]haldclut[vc]"
+        else:
+            graph += f";[vc0]lut3d={lut}[vc]"
+        vmap = "[vc]"
     if edl.get("audio_fix"):
-        graph += f";[ac0]{edl['audio_fix']}[ac]"; amap = "[ac]"
-    if need_silence:
-        graph = graph.replace("__SIL__", str(len(inputs)))  # anullsrc is the input after the files
+        graph += f";[ac0]{edl['audio_fix']}[acf]"; amap = "[acf]"
+
+    music = edl.get("music")
+    if music:
+        total = sum(e - s for s, e in windows)
+        m_start = float(music.get("start", 0.0))
+        fin = float(music.get("fade_in", 0.5))
+        fout = float(music.get("fade_out", 1.5))
+        graph += (f";[__MUS__:a]atrim={m_start:.3f}:{m_start + total:.3f},asetpts=PTS-STARTPTS,"
+                  f"volume={float(music.get('gain_db', -18)):.1f}dB,"
+                  f"afade=t=in:st=0:d={fin:.3f},"
+                  f"afade=t=out:st={max(0.0, total - fout):.3f}:d={fout:.3f},"
+                  f"aformat=channel_layouts=stereo:sample_rates=48000[bg]")
+        if music.get("duck", True):
+            # Sidechain: the speech bus triggers the ducking *and* is mixed back in, so it
+            # has to be split — a label can only be consumed once.
+            graph += (f";{amap}asplit=2[spk][trig]"
+                      f";[bg][trig]sidechaincompress="
+                      f"threshold={float(music.get('threshold', 0.03))}:"
+                      f"ratio={float(music.get('ratio', 8))}:attack=20:release=300[bgd]"
+                      f";[spk][bgd]amix=inputs=2:duration=first:normalize=0[amx]")
+        else:
+            graph += (f";{amap}anull[spk]"
+                      f";[spk][bg]amix=inputs=2:duration=first:normalize=0[amx]")
+        amap = "[amx]"
+
+    # Extra inputs come after the files, in this exact order — keep the indices in step.
+    sil_idx = len(inputs)
+    mus_idx = sil_idx + (1 if need_silence else 0)
+    graph = graph.replace("__SIL__", str(sil_idx)).replace("__MUS__", str(mus_idx))
 
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         f.write(graph + "\n")
@@ -1162,8 +1345,11 @@ def edl_render(edl_path: str, out: str):
             cmd += ["-i", p]
         if need_silence:
             cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
+        if music:
+            # Loop the bed so a short track still covers the whole cut.
+            cmd += ["-stream_loop", "-1", "-i", music["src"]]
         cmd += ["-/filter_complex", gfile, "-map", vmap, "-map", amap,
-                "-c:v", VCODEC, "-b:v", "9M", "-c:a", "aac", "-b:a", "192k",
+                "-c:v", VCODEC, "-b:v", vbitrate, "-c:a", "aac", "-b:a", "192k",
                 "-ar", "48000", "-movflags", "+faststart", out]
         _run(cmd)
     finally:
@@ -1172,6 +1358,290 @@ def edl_render(edl_path: str, out: str):
             import shutil as _shutil
             _shutil.rmtree(_av1_tmp_dir, ignore_errors=True)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Rhythm — pacing, dead air, beats, and snapping cuts to them
+#
+# The mechanical tools above decide WHERE a cut can land. These decide WHEN it should,
+# which is what separates an edit that flows from one that's merely accurate.
+# ---------------------------------------------------------------------------
+
+def edl_report(edl_path: str) -> str:
+    """Render an EDL's pacing as text — shot lengths, split edits, and rhythm warnings.
+
+    "The edit is text" already applies to the cuts; rhythm is part of the edit. A cut list
+    where every shot is the same length reads as monotone however good the picks are, and
+    that's invisible in JSON until you lay the durations side by side.
+    """
+    import statistics
+
+    edl = json.load(open(edl_path))
+    clips = edl["clips"]
+    durs = [float(c["end"]) - float(c["start"]) for c in clips]
+    longest = max(durs)
+    total = sum(durs)
+
+    lines = [f"{'#':>3}  {'source':<22} {'in':>8} {'out':>8} {'dur':>7} {'lead':>6}  rhythm"]
+    for i, (c, d) in enumerate(zip(clips, durs)):
+        lead = float(c.get("audio_lead", 0.0))
+        src = os.path.basename(str(c["src"]))
+        src = "…" + src[-21:] if len(src) > 22 else src
+        lines.append(
+            f"{i:>3}  {src:<22} {float(c['start']):>8.2f} {float(c['end']):>8.2f} "
+            f"{d:>7.2f} {(f'{lead:+.2f}' if lead else '·'):>6}  "
+            + "█" * max(1, round(d / longest * 30)))
+
+    mean = statistics.fmean(durs)
+    cv = (statistics.pstdev(durs) / mean) if mean else 0.0
+    lines += [
+        "",
+        f"{len(clips)} clips · {total:.1f}s · mean {mean:.2f}s · "
+        f"median {statistics.median(durs):.2f}s · range {min(durs):.2f}–{max(durs):.2f}s · "
+        f"variation {cv:.0%}",
+        f"longest hold: clip {durs.index(longest)} ({longest:.2f}s)",
+    ]
+
+    notes = []
+    if len(clips) >= 4 and cv < 0.15:
+        notes.append("shot lengths barely vary — a cut list this even reads as monotone; "
+                     "vary the holds and let them shorten toward the climax")
+    if len(clips) >= 3 and not any(float(c.get("audio_lead", 0.0)) for c in clips):
+        notes.append("no split edits — every cut changes picture and sound on the same "
+                     "frame, which is the main thing that makes a cut feel abrupt; "
+                     "add `audio_lead` on the cuts that should flow")
+    if len(clips) >= 3 and durs[-1] < mean * 0.8:
+        notes.append("the last shot is shorter than average — endings usually want a hold, "
+                     "not the tightest cut in the piece")
+    for note in notes:
+        lines.append(f"  ⚠ {note}")
+    return "\n".join(lines) + "\n"
+
+
+def tighten(src: str, out: str, target_gap: float = 0.5, min_gap: float = 1.0,
+            noise_db: float = -30.0, trim_ends: bool = False) -> dict:
+    """Collapse dead air to a target beat and write the result as an EDL (not a video).
+
+    Every silence longer than `min_gap` is shortened to `target_gap` by removing time from
+    the **middle** of the pause, so the breath at the end of one sentence and the intake
+    before the next both survive — cutting from the edges is what makes tightened speech
+    sound clipped and breathless.
+
+    This is the snappiness pass for talking-head footage, and it is deliberately distinct
+    from `filler-removal`: the words all stay, only the gaps between them shrink. Output is
+    an `edit.json` so the pacing decisions stay reviewable before anything is rendered.
+    """
+    info = video_info(src)
+    dur = info["duration"]
+    spans = speech_segments(src, noise_db=noise_db, min_silence=min(0.3, min_gap / 2))
+
+    cuts = []                                     # (start, end) regions to remove
+    for s0, s1, kind in spans:
+        if kind != "silence" or s1 - s0 <= min_gap:
+            continue
+        leading = s0 <= 0.01
+        trailing = s1 >= dur - 0.01
+        if trim_ends and (leading or trailing):
+            cuts.append((s0, s1))                 # drop head/tail silence outright
+            continue
+        half = target_gap / 2
+        c0, c1 = s0 + half, s1 - half
+        if c1 - c0 > 0.05:
+            cuts.append((c0, c1))
+
+    keeps, cursor = [], 0.0
+    for c0, c1 in cuts:
+        if c0 > cursor + 0.05:
+            keeps.append((cursor, c0))
+        cursor = c1
+    if cursor < dur - 0.05:
+        keeps.append((cursor, dur))
+
+    clips = []
+    for i, (k0, k1) in enumerate(keeps):
+        if i < len(cuts):
+            removed = cuts[i][1] - cuts[i][0]
+            why = (f"hold, then a {removed:.2f}s pause removed "
+                   f"(collapsed to ~{target_gap:.2f}s of breathing room)")
+        else:
+            why = "final segment — nothing after it to tighten against"
+        clips.append({"src": src, "start": round(k0, 3), "end": round(k1, 3),
+                      "rationale": why})
+
+    edl = {"fps": round(info["fps"]), "width": info["width"], "height": info["height"],
+           "clips": clips}
+    with open(out, "w") as f:
+        json.dump(edl, f, indent=2)
+
+    removed_total = sum(c1 - c0 for c0, c1 in cuts)
+    print(f"tightened {len(cuts)} pause(s): {dur:.1f}s → {dur - removed_total:.1f}s "
+          f"(-{removed_total:.1f}s)")
+    print(f"wrote {out} — review it, then: uv run video-agent edl {out} -o out.mp4")
+    return edl
+
+
+def _decode_mono(path: str, sr: int = 22050):
+    """Decode any media file to a mono float32 numpy array at `sr` Hz."""
+    import numpy as np
+    p = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path, "-f", "f32le", "-ac", "1",
+         "-ar", str(sr), "-"],
+        capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed decoding audio:\n{p.stderr.decode().strip()}")
+    return np.frombuffer(p.stdout, dtype=np.float32)
+
+
+def beats(path: str, sr: int = 22050, hop: int = 512, n_fft: int = 1024,
+          min_bpm: float = 60.0, max_bpm: float = 200.0) -> dict:
+    """Find musical beats and tempo → {"bpm", "beats": [s…], "onsets": [s…]}.
+
+    Spectral-flux onset detection: how much energy *appeared* between one frame and the
+    next (rises only — a note starting matters, a note ending doesn't). Tempo comes from
+    autocorrelating that envelope, and the beat grid is the best-fitting phase of that
+    period, so beats stay on the pulse through passages with no drum hit.
+
+    Uses numpy + scipy, both already present via mlx-whisper — no new dependency.
+    """
+    import numpy as np
+    from scipy.signal import find_peaks
+
+    x = _decode_mono(path, sr)
+    if x.size < n_fft * 4:
+        raise RuntimeError(f"{path}: too short to find beats in")
+
+    frames = np.lib.stride_tricks.sliding_window_view(x, n_fft)[::hop]
+    mag = np.abs(np.fft.rfft(frames * np.hanning(n_fft), axis=1))
+    flux = np.maximum(0.0, np.diff(mag, axis=0)).sum(axis=1)
+    flux = np.concatenate([[0.0], flux])
+    if flux.max() > 0:
+        flux /= flux.max()
+    fps_env = sr / hop
+
+    # Onsets: local peaks that clear a moving local average (adapts to quiet/loud passages)
+    win = max(3, int(fps_env * 0.5)) | 1
+    local = np.convolve(flux, np.ones(win) / win, mode="same")
+    peaks, _ = find_peaks(flux, height=local + 0.05, distance=max(1, int(fps_env * 0.08)))
+    onsets = (peaks / fps_env).tolist()
+
+    # Tempo: autocorrelate the onset envelope over the plausible beat-period range
+    env = flux - flux.mean()
+    ac = np.correlate(env, env, mode="full")[len(env) - 1:]
+    lo = max(1, int(fps_env * 60.0 / max_bpm))
+    hi = min(len(ac) - 1, int(fps_env * 60.0 / min_bpm))
+    if hi <= lo:
+        raise RuntimeError("audio too short to estimate tempo")
+    # Autocorrelation peaks just as hard at half and double the real tempo, and it tends to
+    # settle on the slow one. Weight by a log-normal prior around 120 BPM (Ellis 2007) so a
+    # genuine 125 BPM track doesn't get reported — and cut — at 62.
+    lags = np.arange(lo, hi, dtype=float)
+    prior = np.exp(-0.5 * (np.log2((60.0 * fps_env / lags) / 120.0) / 0.9) ** 2)
+    p = lo + int(np.argmax(ac[lo:hi] * prior))
+
+    # Interpolate the autocorrelation peak to a FRACTIONAL period. A whole-frame period is
+    # only accurate to ~23 ms, and that error compounds every beat — over a minute the grid
+    # walks right off the music. The sub-frame fit is what keeps late beats on the pulse.
+    if 0 < p < len(ac) - 1:
+        denom = ac[p - 1] - 2 * ac[p] + ac[p + 1]
+        if denom:
+            p += float(np.clip(0.5 * (ac[p - 1] - ac[p + 1]) / denom, -0.5, 0.5))
+    period_sec = p / fps_env
+    bpm = 60.0 / period_sec
+
+    # Phase: where the grid sits inside one beat. Take the energy-weighted circular mean of
+    # the onsets modulo the period — averaging angles, not times, so onsets either side of a
+    # beat boundary reinforce instead of cancelling.
+    duration = len(flux) / fps_env
+    if len(onsets):
+        ang = 2 * np.pi * (np.asarray(onsets) % period_sec) / period_sec
+        phase = float(np.angle((flux[peaks] * np.exp(1j * ang)).sum())) / (2 * np.pi)
+        phase = (phase * period_sec) % period_sec
+    else:
+        phase = 0.0
+    grid = (phase + np.arange(0, max(1, int((duration - phase) / period_sec) + 1))
+            * period_sec)
+    grid = grid[grid <= duration].tolist()
+
+    return {"bpm": round(float(bpm), 2), "beats": [round(t, 3) for t in grid],
+            "onsets": [round(t, 3) for t in onsets]}
+
+
+def _nearest(candidates, t, tolerance):
+    """Nearest candidate to `t` within `tolerance`, else None."""
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda c: abs(c - t))
+    return best if abs(best - t) <= tolerance else None
+
+
+def snap_edl(edl_path: str, out: str, to: str = "silence", ref: str = None,
+             tolerance: float = 0.35, noise_db: float = -30.0,
+             offset: float = 0.0) -> dict:
+    """Move an EDL's cut points onto silence edges or musical beats, and report every move.
+
+    Two modes, because the two things live on different timelines:
+
+    - `silence` — each clip's in/out is nudged to the nearest speech/silence boundary in its
+      **own source**. This is the snap-into-the-neighbouring-silence step that filler-removal
+      and edl-edit both describe by hand; doing it in code makes it consistent and reviewable.
+    - `beats` — cut points are moved so they land on the beat in the **output** timeline
+      (cumulative running time), which is what "cut on the beat" actually means. `ref` is the
+      music file; `offset` is the bed's own in-point (the EDL's `music.start`).
+
+    Cuts that have no candidate within `tolerance` are left exactly where they were — a snap
+    is a nudge onto a nearby truth, never a drag onto a distant one.
+    """
+    edl = json.load(open(edl_path))
+    clips = edl["clips"]
+    moves = []
+
+    if to == "silence":
+        cache = {}
+        for i, c in enumerate(clips):
+            src = c["src"]
+            if src not in cache:
+                spans = speech_segments(src, noise_db=noise_db)
+                cache[src] = sorted({round(s, 3) for s0, s1, _ in spans for s in (s0, s1)})
+            edges = cache[src]
+            for key in ("start", "end"):
+                t = float(c[key])
+                hit = _nearest(edges, t, tolerance)
+                if hit is not None and abs(hit - t) > 1e-3:
+                    moves.append((i, key, t, hit))
+                    c[key] = round(hit, 3)
+            if c["end"] - c["start"] < 0.1:
+                raise ValueError(f"clip {i}: snapping collapsed it to "
+                                 f"{c['end'] - c['start']:.3f}s — lower --tolerance")
+
+    elif to == "beats":
+        if not ref:
+            raise ValueError("--to beats needs --ref <music file> to find the beat grid")
+        grid = [b - offset for b in beats(ref)["beats"]]
+        t_out = 0.0
+        for i, c in enumerate(clips[:-1]):          # the last out-point ends the piece
+            dur = float(c["end"]) - float(c["start"])
+            hit = _nearest(grid, t_out + dur, tolerance)
+            if hit is not None and hit - t_out > 0.2 and abs(hit - t_out - dur) > 1e-3:
+                new_end = round(float(c["start"]) + (hit - t_out), 3)
+                moves.append((i, "end", float(c["end"]), new_end))
+                c["end"] = new_end
+                if "vend" in c:                     # keep a cutaway the same length as its audio
+                    c["vend"] = round(float(c["vstart"]) + (hit - t_out), 3)
+            t_out += float(c["end"]) - float(c["start"])
+    else:
+        raise ValueError(f"unknown snap target {to!r}; use 'silence' or 'beats'")
+
+    with open(out, "w") as f:
+        json.dump(edl, f, indent=2)
+
+    if moves:
+        print(f"snapped {len(moves)} cut point(s) to {to}:")
+        for i, key, was, now in moves:
+            print(f"  clip {i} {key}: {was:.3f} → {now:.3f}  ({now - was:+.3f}s)")
+    else:
+        print(f"no cut points were within {tolerance}s of a {to} candidate — nothing moved")
+    print(f"wrote {out}")
+    return edl
 
 
 # ---------------------------------------------------------------------------
@@ -1406,6 +1876,43 @@ def main():
     el = sub.add_parser("edl", help="execute an edit.json (clip list + rationale) → one video")
     el.add_argument("edit", help="path to edit.json (see edl-edit skill for schema)")
     el.add_argument("-o", "--out", required=True)
+    el.add_argument("--draft", action="store_true",
+                    help="fast 480p render for the internal verify loop (never a deliverable)")
+    el.add_argument("--report", action="store_true",
+                    help="print the pacing report (shot lengths + rhythm warnings) first")
+    el.add_argument("--dry-run", action="store_true",
+                    help="with --report: show the pacing and exit without rendering")
+
+    tg = sub.add_parser("tighten",
+                        help="collapse dead air to a target beat → writes an edit.json")
+    tg.add_argument("src")
+    tg.add_argument("-o", "--out", required=True, help="output edit.json")
+    tg.add_argument("--target-gap", type=float, default=0.5,
+                    help="what a collapsed pause becomes, in seconds (default 0.5)")
+    tg.add_argument("--min-gap", type=float, default=1.0,
+                    help="only pauses longer than this are touched (default 1.0)")
+    tg.add_argument("--noise", type=float, default=-30.0,
+                    help="silence threshold in dB (quieter rooms: -35 to -40)")
+    tg.add_argument("--trim-ends", action="store_true",
+                    help="also drop leading/trailing silence entirely")
+
+    bt = sub.add_parser("beats", help="detect musical beats + tempo (for cutting on the beat)")
+    bt.add_argument("src", help="music or video file")
+    bt.add_argument("-o", "--out", default=None, help="output file (default: print)")
+    bt.add_argument("--onsets", action="store_true",
+                    help="list detected onsets instead of the inferred beat grid")
+
+    sn = sub.add_parser("snap", help="move an EDL's cut points onto silence edges or beats")
+    sn.add_argument("edit", help="input edit.json")
+    sn.add_argument("-o", "--out", required=True, help="output edit.json")
+    sn.add_argument("--to", default="silence", choices=["silence", "beats"])
+    sn.add_argument("--ref", default=None,
+                    help="reference file for --to beats (the music track)")
+    sn.add_argument("--tolerance", type=float, default=0.35,
+                    help="max distance a cut may be moved, in seconds (default 0.35)")
+    sn.add_argument("--noise", type=float, default=-30.0, help="silence threshold in dB")
+    sn.add_argument("--offset", type=float, default=0.0,
+                    help="music in-point (the EDL's music.start) for --to beats")
 
     gr = sub.add_parser("grade", help="color-grade via .cube/HALD LUTs (apply | preview | gen-lut)")
     gr.add_argument("action", choices=["apply", "preview", "gen-lut"])
@@ -1549,8 +2056,31 @@ def main():
         print(a.out)
 
     elif a.cmd == "edl":
-        edl_render(a.edit, a.out)
-        print(a.out)
+        if a.report or a.dry_run:
+            print(edl_report(a.edit), end="")
+        if not a.dry_run:
+            edl_render(a.edit, a.out, draft=a.draft)
+            print(a.out)
+
+    elif a.cmd == "tighten":
+        tighten(a.src, a.out, target_gap=a.target_gap, min_gap=a.min_gap,
+                noise_db=a.noise, trim_ends=a.trim_ends)
+
+    elif a.cmd == "beats":
+        b = beats(a.src)
+        times = b["onsets"] if a.onsets else b["beats"]
+        text = (f"# bpm {b['bpm']}  ({len(b['beats'])} beats, {len(b['onsets'])} onsets)\n"
+                + "\n".join(f"{t:.3f}" for t in times) + "\n")
+        if a.out:
+            with open(a.out, "w") as f:
+                f.write(text)
+            print(f"bpm {b['bpm']} — wrote {len(times)} times to {a.out}")
+        else:
+            print(text, end="")
+
+    elif a.cmd == "snap":
+        snap_edl(a.edit, a.out, to=a.to, ref=a.ref, tolerance=a.tolerance,
+                 noise_db=a.noise, offset=a.offset)
 
     elif a.cmd == "grade":
         if a.action == "apply":

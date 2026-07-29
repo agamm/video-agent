@@ -11,6 +11,9 @@ recipe below directly.
 
 Decide which tool first:
 - **Visible transition between two shots** (wipe, dissolve, pixelize…) → this skill, `xfade`.
+- **A cut that feels abrupt but shouldn't have a visible effect** → you want a **split edit**,
+  not a transition: stagger the sound and picture with `audio_lead` in the EDL. Reaching for a
+  dissolve to soften a choppy dialogue cut is the classic wrong fix — see `cutting-rhythm`.
 - **Seamless join, no visible effect** (hide a hard cut) → the existing `splice` command
   (`uv run video-agent splice a.mp4 b.mp4 -o out.mp4`) — a fixed 0.04s crossfade.
 - **Effect on the footage itself** (smoke, recolor, restyle) → `grok-video-edit` skill.

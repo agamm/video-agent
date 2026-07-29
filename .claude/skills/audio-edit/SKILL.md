@@ -57,6 +57,11 @@ Combine with normalize in one pass: `-af "afftdn=nr=12,loudnorm=I=-16:TP=-1.5:LR
 
 ## Add background music
 
+**If the edit is an EDL, put the bed in the EDL instead** — `"music": {"src": …, "gain_db":
+-18, "duck": true, "fade_out": 2.0}` mixes it in the same render pass (looped to cover the
+whole cut), so you don't pay for a second re-encode. The recipes below are for a video that's
+already finished, or for a one-off mix outside an EDL.
+
 Plain mix (music sits at a fixed level under the existing audio):
 ```bash
 ffmpeg -y -i in.mp4 -i bg.mp3 -filter_complex \
